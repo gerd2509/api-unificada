@@ -2049,6 +2049,43 @@ app.get('/avance-sedes', async (req, res) => {
   } catch (e) { console.error('❌ GET /avance-sedes:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /avance-vendedor?anio=&mes= → neto por (sede, vendedor, clase PROPIO/ALIADO), con el
+// mismo netting (NC/incaut. arrastradas). Para la tabla por vendedor del módulo Avance de Metas.
+app.get('/avance-vendedor', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureVentasSchema();
+    const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
+    const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;
+    const rows = await cached(`avance-vendedor|${anio}|${mes}`, req.query.fresh, async () => (await pgPool.query(`
+      WITH ent AS (
+        SELECT sede, UPPER(TRIM(COALESCE(vendedor,''))) AS vendedor,
+          CASE WHEN UPPER(COALESCE(entidad,'')) = 'LEONCITO' THEN 'PROPIO' ELSE 'ALIADO' END AS clase,
+          estado_venta, monto_consolidado, anio_cv, mes_cv, anio_af, mes_af
+        FROM ventas
+      ),
+      ven AS (SELECT sede, vendedor, clase, SUM(monto_consolidado) AS monto FROM ent
+        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+          AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) GROUP BY sede, vendedor, clase),
+      nc AS (SELECT sede, vendedor, clase, SUM(monto_consolidado) AS monto FROM ent
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
+          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af) GROUP BY sede, vendedor, clase),
+      inc AS (SELECT sede, vendedor, clase, SUM(monto_consolidado) AS monto FROM ent
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
+          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af) GROUP BY sede, vendedor, clase),
+      claves AS (SELECT sede, vendedor, clase FROM ven UNION SELECT sede, vendedor, clase FROM nc UNION SELECT sede, vendedor, clase FROM inc)
+      SELECT k.sede, k.vendedor, k.clase,
+        ROUND(COALESCE(ven.monto,0) - COALESCE(nc.monto,0) - COALESCE(inc.monto,0))::int AS neto
+      FROM claves k
+      LEFT JOIN ven ON ven.sede=k.sede AND ven.vendedor=k.vendedor AND ven.clase=k.clase
+      LEFT JOIN nc  ON nc.sede=k.sede  AND nc.vendedor=k.vendedor  AND nc.clase=k.clase
+      LEFT JOIN inc ON inc.sede=k.sede AND inc.vendedor=k.vendedor AND inc.clase=k.clase
+      WHERE COALESCE(k.sede,'') <> '' AND COALESCE(k.vendedor,'') <> ''
+      ORDER BY k.sede, k.vendedor`, [anio, mes])).rows);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /avance-vendedor:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // Metas editables por sede (cuadros General y Motos del módulo Avance de Metas).
 // clave: 'general:<sedeNorm>' | 'motos:<sedeNorm>'.
 let metasAvanceLista = false;
