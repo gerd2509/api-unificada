@@ -1990,6 +1990,105 @@ app.get('/productos', async (req, res) => {
   } catch (e) { console.error('❌ GET /productos:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 📊 AVANCE DE METAS (por sede) — módulo "Avance de Metas".
+// GET /avance-sedes?anio=&mes=  → monto NETO + # operaciones por (sede, clase, moto)
+//   clase  = PROPIO (entidad LEONCITO) | ALIADO (entidad ≠ LEONCITO)
+//   es_moto= estado_tipo_producto contiene MOTO (MOTO TAXI / MOTO LINEAL)
+//   neto   = ventas − NC arrastradas − incaut. arrastradas (mismas reglas que /ventas/evolutivo).
+// El front arma: General (créditos NO moto) y Motos, cada uno propio/aliado.
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/avance-sedes', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureVentasSchema();
+    const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
+    const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;   // 0 = todo el año
+    const key = `avance-sedes|${anio}|${mes}`;
+    const rows = await cached(key, req.query.fresh, async () => (await pgPool.query(`
+      WITH ent AS (
+        SELECT sede,
+          CASE WHEN UPPER(COALESCE(entidad,'')) = 'LEONCITO' THEN 'PROPIO' ELSE 'ALIADO' END AS clase,
+          (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto,
+          estado_venta, monto_consolidado, anio_cv, mes_cv, anio_af, mes_af
+        FROM ventas
+      ),
+      ven AS (
+        SELECT sede, clase, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
+        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+          AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2)
+        GROUP BY sede, clase, es_moto
+      ),
+      nc AS (
+        SELECT sede, clase, es_moto, SUM(monto_consolidado) AS monto FROM ent
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
+          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
+        GROUP BY sede, clase, es_moto
+      ),
+      inc AS (
+        SELECT sede, clase, es_moto, SUM(monto_consolidado) AS monto FROM ent
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
+          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
+        GROUP BY sede, clase, es_moto
+      ),
+      claves AS (
+        SELECT sede, clase, es_moto FROM ven
+        UNION SELECT sede, clase, es_moto FROM nc
+        UNION SELECT sede, clase, es_moto FROM inc
+      )
+      SELECT k.sede, k.clase, k.es_moto,
+        ROUND(COALESCE(ven.monto,0) - COALESCE(nc.monto,0) - COALESCE(inc.monto,0))::int AS neto,
+        COALESCE(ven.ops,0)::int AS ops
+      FROM claves k
+      LEFT JOIN ven ON ven.sede=k.sede AND ven.clase=k.clase AND ven.es_moto=k.es_moto
+      LEFT JOIN nc  ON nc.sede=k.sede  AND nc.clase=k.clase  AND nc.es_moto=k.es_moto
+      LEFT JOIN inc ON inc.sede=k.sede AND inc.clase=k.clase AND inc.es_moto=k.es_moto
+      WHERE COALESCE(k.sede,'') <> ''
+      ORDER BY k.sede, k.es_moto, k.clase`, [anio, mes])).rows);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /avance-sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// Metas editables por sede (cuadros General y Motos del módulo Avance de Metas).
+// clave: 'general:<sedeNorm>' | 'motos:<sedeNorm>'.
+let metasAvanceLista = false;
+async function ensureMetasAvanceSchema() {
+  if (!pgPool || metasAvanceLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS metas_avance_sede (
+      id             BIGSERIAL PRIMARY KEY,
+      clave          TEXT UNIQUE NOT NULL,
+      meta           NUMERIC(14,2) NOT NULL DEFAULT 0,
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );`);
+  metasAvanceLista = true;
+}
+// GET /metas-avance → { <clave>: meta }
+app.get('/metas-avance', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureMetasAvanceSchema();
+    res.set('Cache-Control', 'no-store');
+    const { rows } = await pgPool.query('SELECT clave, meta FROM metas_avance_sede');
+    const map = {}; rows.forEach(r => { map[r.clave] = Number(r.meta); });
+    res.json(map);
+  } catch (e) { console.error('❌ GET /metas-avance:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+// PUT /metas-avance { clave, meta } → upsert (edición en la propia tabla del módulo).
+app.put('/metas-avance', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const clave = String(req.body?.clave || '').trim();
+  const meta = Number(req.body?.meta) || 0;
+  if (!clave) return res.status(400).json({ success: false, message: 'Falta clave.' });
+  try {
+    await ensureMetasAvanceSchema();
+    await pgPool.query(
+      `INSERT INTO metas_avance_sede (clave, meta) VALUES ($1, $2)
+       ON CONFLICT (clave) DO UPDATE SET meta = EXCLUDED.meta, actualizado_en = now()`, [clave, meta]);
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /metas-avance:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
   ok: true, service: 'ventas-service', db: !!pgPool, ts: new Date().toISOString(),
