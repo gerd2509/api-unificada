@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+npm-debug.log*
+
+# Service account de Google (secreto — en Render va como Secret File)
+ffvv-realzza-campo-07c3f6b5b98f.json
+*.json
+!package.json
+!package-lock.json
