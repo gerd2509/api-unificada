@@ -1874,15 +1874,17 @@ app.post('/margen-ventas/import', upload.single('archivo'), async (req, res) => 
     return res.status(400).json({ success: false, message: 'No se recibió archivo (campo "archivo").' });
   }
   try {
-    const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const raw = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    let wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    let raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
 
     const rows = [];
     for (const r of raw) {
       const m = mapMargenRow(r);
       if (m) rows.push(m);
     }
+    // Libera cuanto antes las estructuras pesadas del Excel (workbook + filas crudas +
+    // bytes del archivo) para dar memoria a la fase de BD (evita picos/OOM en el unificado).
+    wb = null; raw = null; req.file.buffer = null;
     if (rows.length === 0) {
       return res.status(400).json({ success: false, message: 'El archivo no tiene filas válidas (falta la columna CodigoCV).' });
     }
@@ -1895,13 +1897,15 @@ app.post('/margen-ventas/import', upload.single('archivo'), async (req, res) => 
     try {
       await client.query('BEGIN');
       // Reemplazo por CodigoCV: borra los códigos presentes en el archivo…
-      for (let i = 0; i < codigos.length; i += 5000) {
-        const slice = codigos.slice(i, i + 5000);
+      for (let i = 0; i < codigos.length; i += 10000) {
+        const slice = codigos.slice(i, i + 10000);
         const del = await client.query('DELETE FROM margen_ventas WHERE codigo_cv = ANY($1::bigint[])', [slice]);
         reemplazados += del.rowCount;
       }
-      // …y reinserta todas las filas del archivo.
-      const CHUNK = 800;
+      // …y reinserta todas las filas del archivo. Chunk grande (11 cols → hasta ~5957 filas
+      // por el límite de 65535 parámetros de Postgres) = muchos menos viajes a la BD →
+      // el import termina antes del timeout del proxy (Cloudflare corta ~100s sin CORS).
+      const CHUNK = 5000;
       for (let i = 0; i < rows.length; i += CHUNK) {
         await insertMargenChunk(client, rows.slice(i, i + CHUNK));
       }
