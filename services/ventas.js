@@ -1866,67 +1866,86 @@ async function insertMargenChunk(client, chunk) {
   await client.query(`INSERT INTO margen_ventas (${MARGEN_COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
 }
 
-app.post('/margen-ventas/import', upload.single('archivo'), async (req, res) => {
+// Estado del procesamiento en segundo plano del margen (in-memory, 1 solo proceso).
+let margenJob = { procesando: false, error: null, startedAt: null, archivo: null };
+
+// Procesa el Excel de margen (parse + reemplazo por CodigoCV) FUERA del ciclo HTTP.
+// El import responde 202 al instante y esto corre en background → no lo mata el
+// timeout del proxy (Cloudflare corta ~100s y ese 524 no trae CORS, el navegador
+// lo confunde con un error de CORS).
+async function procesarMargen(buffer, meta) {
+  let wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  let raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+  const rows = [];
+  for (const r of raw) {
+    const m = mapMargenRow(r);
+    if (m) rows.push(m);
+  }
+  // Libera las estructuras pesadas del Excel antes de la fase de BD (baja el pico de memoria).
+  wb = null; raw = null; buffer = null;
+  if (rows.length === 0) {
+    const e = new Error('El archivo no tiene filas válidas (falta la columna CodigoCV).');
+    e.userMessage = e.message; throw e;
+  }
+
+  const codigos = Array.from(new Set(rows.map(r => r[0])));
+  await ensureMargenSchema();
+  const client = await pgPool.connect();
+  let reemplazados = 0;
+  try {
+    await client.query('BEGIN');
+    // Reemplazo por CodigoCV: borra los códigos presentes en el archivo…
+    for (let i = 0; i < codigos.length; i += 10000) {
+      const slice = codigos.slice(i, i + 10000);
+      const del = await client.query('DELETE FROM margen_ventas WHERE codigo_cv = ANY($1::bigint[])', [slice]);
+      reemplazados += del.rowCount;
+    }
+    // …y reinserta todas las filas. Chunk grande (11 cols → hasta ~5957 por el límite de
+    // 65535 parámetros de Postgres) = muchos menos viajes a la BD.
+    const CHUNK = 5000;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      await insertMargenChunk(client, rows.slice(i, i + CHUNK));
+    }
+    await client.query(
+      `INSERT INTO margen_ventas_cargas (cargado_por, archivo, filas, codigos, reemplazados)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [meta.cargado_por, meta.archivo, rows.length, codigos.length, reemplazados]
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  return { filas: rows.length, codigos: codigos.length, reemplazados };
+}
+
+app.post('/margen-ventas/import', upload.single('archivo'), (req, res) => {
   if (!pgPool) {
     return res.status(500).json({ success: false, message: 'Base de datos no configurada (falta DATABASE_URL).' });
   }
   if (!req.file) {
     return res.status(400).json({ success: false, message: 'No se recibió archivo (campo "archivo").' });
   }
-  try {
-    let wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
-    let raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
-
-    const rows = [];
-    for (const r of raw) {
-      const m = mapMargenRow(r);
-      if (m) rows.push(m);
-    }
-    // Libera cuanto antes las estructuras pesadas del Excel (workbook + filas crudas +
-    // bytes del archivo) para dar memoria a la fase de BD (evita picos/OOM en el unificado).
-    wb = null; raw = null; req.file.buffer = null;
-    if (rows.length === 0) {
-      return res.status(400).json({ success: false, message: 'El archivo no tiene filas válidas (falta la columna CodigoCV).' });
-    }
-
-    const codigos = Array.from(new Set(rows.map(r => r[0])));
-
-    await ensureMargenSchema();
-    const client = await pgPool.connect();
-    let reemplazados = 0;
-    try {
-      await client.query('BEGIN');
-      // Reemplazo por CodigoCV: borra los códigos presentes en el archivo…
-      for (let i = 0; i < codigos.length; i += 10000) {
-        const slice = codigos.slice(i, i + 10000);
-        const del = await client.query('DELETE FROM margen_ventas WHERE codigo_cv = ANY($1::bigint[])', [slice]);
-        reemplazados += del.rowCount;
-      }
-      // …y reinserta todas las filas del archivo. Chunk grande (11 cols → hasta ~5957 filas
-      // por el límite de 65535 parámetros de Postgres) = muchos menos viajes a la BD →
-      // el import termina antes del timeout del proxy (Cloudflare corta ~100s sin CORS).
-      const CHUNK = 5000;
-      for (let i = 0; i < rows.length; i += CHUNK) {
-        await insertMargenChunk(client, rows.slice(i, i + CHUNK));
-      }
-      await client.query(
-        `INSERT INTO margen_ventas_cargas (cargado_por, archivo, filas, codigos, reemplazados)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [toStr(req.body && req.body.cargado_por), req.file.originalname || null, rows.length, codigos.length, reemplazados]
-      );
-      await client.query('COMMIT');
-    } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
-    } finally {
-      client.release();
-    }
-
-    res.json({ success: true, filas: rows.length, codigos: codigos.length, reemplazados, updated_at: new Date().toISOString() });
-  } catch (error) {
-    console.error('❌ Error en POST /margen-ventas/import:', error);
-    res.status(500).json({ success: false, message: 'No se pudo importar el archivo de margen.' });
+  if (margenJob.procesando) {
+    return res.status(409).json({ success: false, message: 'Ya hay una carga de margen en proceso. Espera a que termine.' });
   }
+
+  const buffer = req.file.buffer;
+  const meta = { archivo: req.file.originalname || null, cargado_por: toStr(req.body && req.body.cargado_por) };
+  margenJob = { procesando: true, error: null, startedAt: Date.now(), archivo: meta.archivo };
+
+  // Responde de inmediato; el frontend consulta /margen-ventas/estado hasta que termine.
+  res.status(202).json({ success: true, procesando: true, message: 'Archivo recibido; procesando en segundo plano.' });
+
+  procesarMargen(buffer, meta)
+    .then(r => { console.log(`✅ Margen importado (bg): ${r.filas} filas / ${r.codigos} códigos`); margenJob.procesando = false; })
+    .catch(err => {
+      console.error('❌ Error procesando margen (bg):', err);
+      margenJob.error = err.userMessage || 'No se pudo importar el archivo de margen.';
+      margenJob.procesando = false;
+    });
 });
 
 app.get('/margen-ventas/estado', async (req, res) => {
@@ -1937,7 +1956,10 @@ app.get('/margen-ventas/estado', async (req, res) => {
     const { rows: cargas } = await pgPool.query(
       'SELECT cargado_por, archivo, filas, codigos, reemplazados, creado_en FROM margen_ventas_cargas ORDER BY id DESC LIMIT 1'
     );
-    res.json({ success: true, total: rows[0].total, updated_at: rows[0].updated_at, ultimaCarga: cargas[0] || null });
+    res.json({
+      success: true, total: rows[0].total, updated_at: rows[0].updated_at, ultimaCarga: cargas[0] || null,
+      procesando: margenJob.procesando, error: margenJob.error,
+    });
   } catch (error) {
     console.error('❌ Error en GET /margen-ventas/estado:', error);
     res.status(500).json({ success: false, message: 'No se pudo obtener el estado de margen.' });
