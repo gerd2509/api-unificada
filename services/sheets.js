@@ -1909,6 +1909,52 @@ app.delete('/gestion-call/:id', async (req, res) => {
   } catch (e) { console.error('❌ DELETE /gestion-call/:id', e); res.status(500).json({ success: false, message: 'No se pudo eliminar.' }); }
 });
 
+// POST /gestion-call/migrar-brenda-realzza?key=brenda-sep-2026 — migración one-shot.
+// Mueve las gestiones de BRENDA (BERNAL BAZAN BRENDA) de gestion_call → gestion_realzza
+// para septiembre-2026 en adelante (su pase de canal). Transaccional e idempotente:
+// solo mueve las filas que sigan en gestion_call. tipo_cliente → tipo_base; kommo se
+// descarta (no existe en Realzza). asesor_contact → asesor_realzza.
+app.post('/gestion-call/migrar-brenda-realzza', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  if (req.query.key !== 'brenda-sep-2026') return res.status(403).json({ success: false, message: 'Clave inválida.' });
+  const cliente = await pgPool.connect();
+  try {
+    await ensureGestionCallSchema();
+    await ensureGestionRealzzaSchema();
+    const WHERE = `asesor_contact ILIKE '%BERNAL BAZAN BRENDA%'
+      AND marca_temporal >= '2026-09-01' AND marca_temporal < '2026-10-01'`;
+    await cliente.query('BEGIN');
+    const antes = await cliente.query(`SELECT COUNT(*)::int AS n FROM gestion_call WHERE ${WHERE}`);
+    const ins = await cliente.query(`
+      INSERT INTO gestion_realzza (
+        marca_temporal, marca_temporal_raw, asesor_realzza, sede, tipo_base,
+        dni_cliente, celular_gestionado, estado_gestion, medio_primer_contacto,
+        resultado_gestion, producto_interes, motivo_interes, motivo_agendamiento,
+        fecha_interes_agendamiento, hora_interes_agendamiento, comentario_agendamiento,
+        fecha_interes_derivacion, hora_interes_derivacion, comentario_derivacion,
+        motivo_no_interes, comentario_no_interes, motivo_no_atendible, comentario_no_atendible,
+        motivos_tercero_relacionado, fecha_rellamada, hora_rellamada, numero_titular_actual,
+        motivo_no_contacto, motivo_no_cierre, comentario_venta_no_concretada, origen)
+      SELECT
+        marca_temporal, marca_temporal_raw, asesor_contact, sede, tipo_cliente,
+        dni_cliente, celular_gestionado, estado_gestion, medio_primer_contacto,
+        resultado_gestion, producto_interes, motivo_interes, motivo_agendamiento,
+        fecha_interes_agendamiento, hora_interes_agendamiento, comentario_agendamiento,
+        fecha_interes_derivacion, hora_interes_derivacion, comentario_derivacion,
+        motivo_no_interes, comentario_no_interes, motivo_no_atendible, comentario_no_atendible,
+        motivos_tercero_relacionado, fecha_rellamada, hora_rellamada, numero_titular_actual,
+        motivo_no_contacto, motivo_no_cierre, comentario_venta_no_concretada, COALESCE(origen,'app')
+      FROM gestion_call WHERE ${WHERE}`);
+    const del = await cliente.query(`DELETE FROM gestion_call WHERE ${WHERE}`);
+    await cliente.query('COMMIT');
+    res.json({ success: true, encontradas: antes.rows[0].n, insertadas: ins.rowCount, eliminadas: del.rowCount });
+  } catch (e) {
+    await cliente.query('ROLLBACK').catch(() => {});
+    console.error('❌ POST /gestion-call/migrar-brenda-realzza', e);
+    res.status(500).json({ success: false, message: 'No se pudo migrar.' });
+  } finally { cliente.release(); }
+});
+
 // POST /gestion-call/match — { dnis: [...] } → { <dni>: {asesor, tipo_cliente, sede, kommo, celular} }
 // Devuelve la ÚLTIMA gestión Call de cada DNI (para atribuir las ventas del Excel).
 app.post('/gestion-call/match', async (req, res) => {
