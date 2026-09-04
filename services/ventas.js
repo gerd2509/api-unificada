@@ -643,13 +643,16 @@ function registrarCanal(canal, ruta) {
       // afectación (NC/refacturación/incautación) no dependen solo del Excel Realzza,
       // y el monto real por mes queda exacto (la NC resta en su mes de afectación real).
       const j = !!c.joinAfect;
-      const px = j ? 'r.' : '';                          // prefijo de columnas base
-      const afA = j ? 'COALESCE(v.anio_af, r.anio_af)' : 'anio_af';
-      const afM = j ? 'COALESCE(v.mes_af,  r.mes_af)'  : 'mes_af';
-      // Realzza: el vendedor autoritativo es el de `ventas` (base editable) — igual que el
-      // módulo (/modulo). Así una edición del vendedor en `ventas` se refleja en Mi Panel.
-      const vendCol = j ? 'COALESCE(v.vendedor, r.vendedor)' : `${px}vendedor`;
+      // Realzza (joinAfect): la fuente base es `ventas` (sede REALZZA STORE) — IGUAL que el
+      // módulo (/modulo). Así Mi Panel muestra TODAS las ventas atribuidas del vendedor
+      // aunque aún no se haya importado el Excel de ventas_realzza de ese mes. Se enriquece
+      // con ventas_realzza (r) para tipo_base/asesor/extranjero cuando existe.
+      const px = j ? 'v.' : '';                          // prefijo de columnas base
+      const afA = j ? 'v.anio_af' : 'anio_af';
+      const afM = j ? 'v.mes_af'  : 'mes_af';
+      const vendCol = j ? 'v.vendedor' : `${px}vendedor`;
       const cond = [], params = [];
+      if (j) cond.push(`v.sede ILIKE '%REALZZA%'`);      // solo tienda Realzza
       const anio = req.query.anio ? parseInt(req.query.anio, 10) : null;
       const mes  = req.query.mes  ? parseInt(req.query.mes, 10)  : null;
       if (anio && mes) {
@@ -663,7 +666,6 @@ function registrarCanal(canal, ruta) {
 
       // Realzza (joinAfect): sin_derivacion se calcula EN VIVO cruzando gestion_realzza
       // (igual que /modulo y Atribución), NO desde la columna congelada de ventas_realzza.
-      // Así una derivación agregada tras consolidar se refleja en Mi Panel al recargar.
       let derivLateral = '';
       let sinDerivExpr = 'r.sin_derivacion';
       if (j) {
@@ -671,29 +673,28 @@ function registrarCanal(canal, ruta) {
         derivLateral = `
            LEFT JOIN LATERAL (
              SELECT gr.marca_temporal FROM gestion_realzza gr
-             WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(r.doc_identidad, '\\D', '', 'g')
+             WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
                AND gr.motivo_interes = ANY($${pmot})
-               AND gr.marca_temporal::date <= r.fecha_cv
-               AND r.fecha_cv - gr.marca_temporal::date <= 31
+               AND gr.marca_temporal::date <= v.fecha_cv
+               AND v.fecha_cv - gr.marca_temporal::date <= 31
              ORDER BY gr.marca_temporal DESC LIMIT 1
            ) grz ON true`;
-        sinDerivExpr = '(grz.marca_temporal IS NULL AND (r.anio_cv > 2026 OR (r.anio_cv = 2026 AND r.mes_cv >= 8)))';
+        sinDerivExpr = '(grz.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8)))';
       }
 
       const sql = j
-        ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
-                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, COALESCE(v.vendedor, r.vendedor) AS vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, ${sinDerivExpr} AS sin_derivacion, r.extranjero, r.asesor_manual, r.fecha_cv,
-                  COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
-                  COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
-                  COALESCE(v.mes_af,  r.mes_af)  AS mes_af,
-                  COALESCE(v.anio_af, r.anio_af) AS anio_af,
-                  make_date(NULLIF(COALESCE(v.anio_af, r.anio_af),0),
-                            NULLIF(COALESCE(v.mes_af,  r.mes_af),0),
-                            NULLIF(COALESCE(v.dia_af,  r.dia_af),0)) AS fecha_af
-           FROM ${c.tabla} r
-           LEFT JOIN ventas v ON v.codigo_cv = r.codigo_cv${derivLateral}
+        ? `SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+                  v.doc_identidad, v.productos, v.cuotas, COALESCE(r.asesor_venta, v.asesor_venta) AS asesor_venta,
+                  v.vendedor, v.entidad, NULLIF(r.tipo_base,'') AS tipo_base, v.tipo_credito,
+                  COALESCE(r.tipo_producto, v.estado_tipo_producto) AS tipo_producto,
+                  ${sinDerivExpr} AS sin_derivacion, COALESCE(r.extranjero, false) AS extranjero,
+                  COALESCE(r.asesor_manual, false) AS asesor_manual, v.fecha_cv,
+                  v.estado_venta AS estado_venta, v.dia_af AS dia_af, v.mes_af AS mes_af, v.anio_af AS anio_af,
+                  make_date(NULLIF(v.anio_af,0), NULLIF(v.mes_af,0), NULLIF(v.dia_af,0)) AS fecha_af
+           FROM ventas v
+           LEFT JOIN ventas_realzza r ON r.codigo_cv = v.codigo_cv${derivLateral}
            ${where}
-           ORDER BY r.fecha_cv DESC NULLS LAST, r.codigo_cv DESC`
+           ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`
         : `SELECT * FROM ${c.tabla} ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`;
 
       const key = `${ruta}|${req.query.anio || ''}|${req.query.mes || ''}|${req.query.sede || ''}|${req.query.vendedor || ''}`;
