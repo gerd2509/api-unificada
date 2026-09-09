@@ -2157,6 +2157,45 @@ app.get('/reporte-global', async (req, res) => {
   } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /reporte-global-motos?anio=&mes= → motos a nivel detalle por (sede, credito, marca,
+//   tipo, vendedor) con el # de motos vendidas. Para las tablas de motos del Reporte Global:
+//   · credito: GLOBAL (entidad GLOBAL GO) / PROPIO (resto, principalmente LEONCITO).
+//   · marca:   WANXIN / SSENDA / OTRAS (según el texto del producto).
+//   · tipo:    MOTO CARGUERA (si el producto dice 'TRIMOTO DE CARGA'), MOTO LINEAL, MOTOTAXI.
+//     OJO carguera: en estado_tipo_producto figura como 'MOTO TAXI'; se reclasifica por el
+//     texto 'TRIMOTO DE CARGA' del producto (las mototaxis dicen 'TRIMOTO DE PASAJEROS').
+//   Solo ventas reales (excluye NOTA DE / INCAUTAC, monto > 0), por mes de venta (anio_cv/mes_cv).
+app.get('/reporte-global-motos', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureVentasSchema();
+    const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
+    const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;
+    const rows = await cached(`reporte-global-motos|${anio}|${mes}`, req.query.fresh, async () => (await pgPool.query(`
+      SELECT sede,
+        CASE WHEN UPPER(COALESCE(entidad,'')) = 'GLOBAL GO' THEN 'GLOBAL' ELSE 'PROPIO' END AS credito,
+        CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%WANXIN%' THEN 'WANXIN'
+             WHEN UPPER(COALESCE(productos,'')) LIKE '%SSENDA%' THEN 'SSENDA'
+             ELSE 'OTRAS' END AS marca,
+        CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO DE CARGA%' THEN 'MOTO CARGUERA'
+             WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%LINEAL%' THEN 'MOTO LINEAL'
+             WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%TAXI%'
+               OR UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO%' THEN 'MOTOTAXI'
+             ELSE 'OTRO' END AS tipo,
+        COALESCE(NULLIF(TRIM(vendedor),''), '(sin vendedor)') AS vendedor,
+        COUNT(*)::int AS motos
+      FROM ventas
+      WHERE UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'
+        AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%'
+        AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+        AND monto_consolidado > 0
+        AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2)
+      GROUP BY sede, credito, marca, tipo, vendedor
+      ORDER BY sede, motos DESC`, [anio, mes])).rows);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // GET /margen-linea-sede?anio=&mes= → ventas/margen por (sede, línea real), desde margen_ventas.
 // Para el cuadro "Margen por Línea Real × Sede" del Reporte Global. La sede viene SIN el
 // prefijo 'SEDE RELENOR' (el front la normaliza igual que las demás).
