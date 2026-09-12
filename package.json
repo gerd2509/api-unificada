@@ -4,7 +4,7 @@
   "description": "Servicio unificado (sheets + ventas + gestion) para Leoncito — reemplaza los 3 microservicios en un solo despliegue.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node --max-old-space-size=400 server.js"
   },
   "engines": {
     "node": ">=18"

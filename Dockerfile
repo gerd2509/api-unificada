@@ -9,4 +9,6 @@ RUN npm install --omit=dev
 COPY . .
 
 EXPOSE 3000
-CMD ["node", "server.js"]
+# Amplía el heap de Node: el contenedor tiene 512MB pero Node por defecto se limita a
+# ~256MB → OOM ("Reached heap limit"). 400MB deja margen para overhead/external.
+CMD ["node", "--max-old-space-size=400", "server.js"]
