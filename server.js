@@ -36,5 +36,6 @@ app.get('/', (_req, res) => res.json({
 app.use('/sheets',  require('./services/sheets'));
 app.use('/ventas',  require('./services/ventas'));
 app.use('/gestion', require('./services/gestion'));
+app.use('/aula',    require('./services/aula'));
 
 app.listen(PORT, () => console.log(`✅ API unificada escuchando en http://localhost:${PORT}  (/sheets · /ventas · /gestion)`));
