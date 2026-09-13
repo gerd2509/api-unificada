@@ -1,10 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // aula.js — Aula Virtual (capacitación de vendedores)
-// Cursos → Lecciones (PDF) → Preguntas (generadas por IA, revisadas por el admin
-// antes de publicarse) → Progreso/Examen por vendedor → Gamificación (XP, nivel,
-// racha, insignias, ranking). Misma BD (DATABASE_URL) que el resto de api-unificada.
-// PDFs en Supabase Storage (bucket privado "aula-virtual"), igual patrón que las
-// fotos del supervisor en gestion.js.
+// Cursos → Lecciones (PDF/PPT/Word/Excel) → Preguntas (creadas manualmente por el
+// admin) → Progreso/Examen por vendedor → Gamificación (XP, nivel, racha,
+// insignias, ranking). Misma BD (DATABASE_URL) que el resto de api-unificada.
+// Archivos en Supabase Storage (bucket privado "aula-virtual"), igual patrón que
+// las fotos del supervisor en gestion.js.
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const express = require('express');
@@ -64,11 +64,6 @@ async function urlFirmada(path, seg = 7200) {
     const j = await r.json();
     return j.signedURL ? `${SB_URL}/storage/v1${j.signedURL}` : null;
   } catch { return null; }
-}
-async function descargarArchivo(path) {
-  const r = await fetch(`${SB_URL}/storage/v1/object/${BUCKET}/${path}`, { headers: sbHeaders() });
-  if (!r.ok) throw new Error('No se pudo leer el archivo del curso.');
-  return Buffer.from(await r.arrayBuffer());
 }
 
 // ── Esquema ───────────────────────────────────────────────────────────────────
@@ -338,73 +333,6 @@ app.put('/admin/preguntas/:id', async (req, res) => {
 app.delete('/admin/preguntas/:id', async (req, res) => {
   try { await pgPool.query('DELETE FROM aula_preguntas WHERE id=$1', [req.params.id]); res.json({ success: true }); }
   catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// Extrae texto de un PDF (buffer) — pdf-parse es puro JS, sin dependencias nativas.
-async function extraerTextoPdf(buffer) {
-  const pdfParse = require('pdf-parse');
-  const data = await pdfParse(buffer);
-  return (data.text || '').trim();
-}
-
-// Genera preguntas BORRADOR con IA a partir del contenido de la lección (PDF).
-// Quedan con aprobada=false: el admin las revisa/edita/aprueba antes de publicarlas.
-app.post('/admin/lecciones/:id/generar-preguntas', async (req, res) => {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(400).json({ success: false, message: 'Falta configurar ANTHROPIC_API_KEY en el servidor. Mientras tanto puedes crear las preguntas manualmente.' });
-  try {
-    const { rows } = await pgPool.query('SELECT * FROM aula_lecciones WHERE id=$1', [req.params.id]);
-    const leccion = rows[0];
-    if (!leccion) return res.status(404).json({ success: false, message: 'Lección no encontrada.' });
-    if (!leccion.archivo_path) return res.status(400).json({ success: false, message: 'La lección no tiene un archivo PDF cargado.' });
-
-    const buffer = await descargarArchivo(leccion.archivo_path);
-    const texto = (await extraerTextoPdf(buffer)).slice(0, 14000);
-    if (!texto || texto.length < 40)
-      return res.status(400).json({ success: false, message: 'No se pudo extraer texto legible del PDF (¿son solo imágenes?). Crea las preguntas manualmente.' });
-
-    const cantidad = Math.min(8, Math.max(3, parseInt(req.body?.cantidad, 10) || 5));
-    const prompt = `Eres un experto en capacitación de equipos de ventas. A partir del siguiente contenido de una `
-      + `diapositiva/material de entrenamiento, genera ${cantidad} preguntas de opción múltiple (4 alternativas cada `
-      + `una, solo UNA correcta) para evaluar la comprensión de un vendedor. Las preguntas deben ser claras, en `
-      + `español, y basarse ÚNICAMENTE en el contenido dado (no inventes datos que no estén ahí).\n\n`
-      + `Responde ÚNICAMENTE con un JSON array (sin texto adicional, sin markdown) con este formato exacto:\n`
-      + `[{"pregunta":"...","opciones":["...","...","...","..."],"respuesta_correcta":0,"explicacion":"..."}]\n\n`
-      + `"respuesta_correcta" es el índice (0-3) de la opción correcta dentro de "opciones".\n\n`
-      + `--- CONTENIDO ---\n${texto}`;
-
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
-        max_tokens: 3000,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    if (!resp.ok) throw new Error('IA respondió ' + resp.status + ': ' + (await resp.text().catch(() => '')));
-    const data = await resp.json();
-    let texto2 = (data.content || []).map(c => c.text || '').join('').trim();
-    texto2 = texto2.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
-    let preguntas;
-    try { preguntas = JSON.parse(texto2); } catch { throw new Error('La IA no devolvió un JSON válido.'); }
-    if (!Array.isArray(preguntas) || !preguntas.length) throw new Error('La IA no generó preguntas.');
-
-    const creadas = [];
-    for (const [i, p] of preguntas.entries()) {
-      if (!p || !p.pregunta || !Array.isArray(p.opciones) || p.opciones.length < 2) continue;
-      const { rows: ins } = await pgPool.query(
-        `INSERT INTO aula_preguntas (leccion_id, pregunta, opciones, respuesta_correcta, explicacion, aprobada, origen, orden)
-         VALUES ($1,$2,$3,$4,$5,false,'ia',$6) RETURNING *`,
-        [leccion.id, p.pregunta, JSON.stringify(p.opciones), Number(p.respuesta_correcta) || 0, p.explicacion || '', i]);
-      creadas.push(ins[0]);
-    }
-    if (!creadas.length) return res.status(400).json({ success: false, message: 'La IA no generó preguntas utilizables.' });
-    res.json({ success: true, preguntas: creadas });
-  } catch (e) {
-    console.error('❌ POST /aula/admin/.../generar-preguntas', e);
-    res.status(500).json({ success: false, message: e.message || 'No se pudieron generar las preguntas.' });
-  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
