@@ -502,6 +502,52 @@ app.get('/ranking', async (_req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ADMIN — Progreso del equipo (para ver cómo va respondiendo cada vendedor)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Un resumen por vendedor: cuántas lecciones vio/aprobó, su promedio, intentos, XP y
+// última actividad. Base para la tabla "Progreso de vendedores" del admin.
+app.get('/admin/progreso', async (_req, res) => {
+  try {
+    const { rows } = await pgPool.query(`
+      SELECT p.vendedor,
+        COUNT(*) FILTER (WHERE p.visto)::int AS vistas,
+        COUNT(*) FILTER (WHERE p.aprobado)::int AS aprobadas,
+        COUNT(*)::int AS con_intento,
+        ROUND(AVG(p.mejor_puntaje) FILTER (WHERE p.intentos > 0))::int AS promedio,
+        COALESCE(SUM(p.intentos),0)::int AS intentos,
+        COALESCE(SUM(l.xp) FILTER (WHERE p.aprobado),0)::int AS xp,
+        MAX(p.fecha_visto) AS ultima_actividad
+      FROM aula_progreso p JOIN aula_lecciones l ON l.id = p.leccion_id
+      GROUP BY p.vendedor ORDER BY ultima_actividad DESC NULLS LAST`);
+    const { rows: totalRows } = await pgPool.query('SELECT COUNT(*)::int AS n FROM aula_lecciones WHERE activo');
+    const totalLecciones = totalRows[0]?.n || 0;
+    res.json(rows.map(r => ({ ...r, nivel: nivelDe(r.xp), total_lecciones: totalLecciones })));
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// Detalle lección por lección de UN vendedor (para ver qué respondió y con qué nota).
+app.get('/admin/progreso/:vendedor', async (req, res) => {
+  try {
+    const vendedor = norm(req.params.vendedor);
+    const { rows: detalle } = await pgPool.query(`
+      SELECT c.titulo AS curso, l.titulo AS leccion, l.xp,
+        COALESCE(p.visto,false) AS visto, p.fecha_visto,
+        COALESCE(p.intentos,0)::int AS intentos, COALESCE(p.mejor_puntaje,0) AS mejor_puntaje,
+        COALESCE(p.aprobado,false) AS aprobado, p.fecha_aprobado
+      FROM aula_lecciones l
+      JOIN aula_cursos c ON c.id = l.curso_id
+      LEFT JOIN aula_progreso p ON p.leccion_id = l.id AND p.vendedor = $1
+      WHERE l.activo AND c.activo
+      ORDER BY c.orden, c.id, l.orden, l.id`, [vendedor]);
+    const { rows: insigniasVend } = await pgPool.query(
+      'SELECT codigo, fecha FROM aula_insignias_vendedor WHERE vendedor=$1 ORDER BY fecha DESC', [vendedor]);
+    const insignias = insigniasVend.map(iv => ({ ...INSIGNIAS.find(i => i.codigo === iv.codigo), fecha: iv.fecha })).filter(i => i.codigo);
+    res.json({ detalle, insignias, racha: await calcularRacha(vendedor) });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'aula-virtual', ts: new Date().toISOString() }));
 
 module.exports = app;
