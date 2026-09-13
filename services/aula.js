@@ -456,7 +456,9 @@ app.get('/lecciones/:id', async (req, res) => {
     const { rows } = await pgPool.query('SELECT * FROM aula_lecciones WHERE id=$1', [req.params.id]);
     const l = rows[0];
     if (!l) return res.status(404).json({ success: false, message: 'Lección no encontrada.' });
-    const url = l.archivo_path ? await urlFirmada(l.archivo_path) : null;
+    // 6h de validez: tiempo suficiente para que el visor (PDF nativo u Office Online para
+    // PPT/Word/Excel) termine de cargar sin que la URL firmada expire a medio visionado.
+    const url = l.archivo_path ? await urlFirmada(l.archivo_path, 21600) : null;
     res.json({ ...l, url });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
