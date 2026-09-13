@@ -427,13 +427,18 @@ app.post('/lecciones/:id/examen', async (req, res) => {
       'SELECT id, respuesta_correcta, explicacion, opciones FROM aula_preguntas WHERE leccion_id=$1 AND aprobada', [req.params.id]);
     if (!preguntas.length) return res.status(400).json({ success: false, message: 'Esta lección aún no tiene examen publicado.' });
 
+    // OJO: id es BIGSERIAL → node-pg lo devuelve como STRING ("1"), no como number.
+    // Hay que normalizar AMBOS lados a Number antes de comparar (si no, "1" !== 1 en el
+    // Map y todo sale como no-contestado → 0% aunque el vendedor haya marcado bien).
     const porId = new Map(respuestas.map(r => [Number(r.pregunta_id), Number(r.opcion)]));
     let correctas = 0;
     const detalle = preguntas.map(p => {
-      const marcada = porId.has(p.id) ? porId.get(p.id) : -1;
-      const ok = marcada === p.respuesta_correcta;
+      const pid = Number(p.id);
+      const marcada = porId.has(pid) ? porId.get(pid) : -1;
+      const correcta = Number(p.respuesta_correcta);
+      const ok = marcada === correcta;
       if (ok) correctas++;
-      return { pregunta_id: p.id, marcada, correcta: p.respuesta_correcta, explicacion: p.explicacion, acerto: ok };
+      return { pregunta_id: pid, marcada, correcta, explicacion: p.explicacion, acerto: ok };
     });
     const puntaje = Math.round((correctas / preguntas.length) * 100);
     const aprobadoAhora = puntaje >= NOTA_APROBATORIA;
