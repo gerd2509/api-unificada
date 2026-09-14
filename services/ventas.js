@@ -1791,6 +1791,23 @@ function registrarLeads(canal, ruta) {
       res.status(500).json({ success: false, message: 'No se pudieron obtener los leads.' });
     }
   });
+  // Leads EN DETALLE (fila por fila) de un mes — para Embudos de Gestión (embudo
+  // KOMMO/LEADS): ASIGNADOS = # leads creados ese mes; CONTACTADOS = con "modificado_por".
+  app.get(`/${ruta}/detalle`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureLeadsSchema(canal);
+      const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
+      const mes = parseInt(req.query.mes, 10) || (new Date().getMonth() + 1);
+      const { rows } = await pgPool.query(
+        `SELECT id, nombre_lead, responsable, modificado_por FROM ${c.tabla} WHERE anio_cr = $1 AND mes_cr = $2`,
+        [anio, mes]);
+      res.json(rows);
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}/detalle:`, error);
+      res.status(500).json({ success: false, message: 'No se pudieron obtener los leads.' });
+    }
+  });
 }
 registrarLeads('call', 'leads-kommo-call');
 registrarLeads('realzza', 'leads-kommo-realzza');
