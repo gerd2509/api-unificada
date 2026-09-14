@@ -763,6 +763,38 @@ app.put('/permisos', async (req, res) => {
   } catch (e) { console.error('❌ PUT /permisos', e); res.status(500).json({ success: false, message: 'No se pudieron guardar los permisos.' }); }
 });
 
+// POST /permisos/revocar-aula-virtual?key=... — one-shot: quita aula-virtual y
+// aula-virtual-admin de TODAS las claves rol-perfil (tabla permisos) y de cualquier
+// override individual (usuarios.modulos). Transaccional e idempotente (re-ejecutarlo
+// no afecta nada si ya no queda el módulo en ningún lado).
+app.post('/permisos/revocar-aula-virtual', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  if (req.query.key !== 'revocar-aula-2026') return res.status(403).json({ success: false, message: 'Clave inválida.' });
+  const client = await pgPool.connect();
+  try {
+    await ensurePermisosSchema();
+    await client.query('BEGIN');
+    const perm = await client.query(`
+      UPDATE permisos SET modulos = (modulos - 'aula-virtual') - 'aula-virtual-admin', actualizado_en = now()
+      WHERE modulos ? 'aula-virtual' OR modulos ? 'aula-virtual-admin'
+      RETURNING clave`);
+    const usr = await client.query(`
+      UPDATE usuarios SET modulos = (modulos - 'aula-virtual') - 'aula-virtual-admin', actualizado_en = now()
+      WHERE modulos IS NOT NULL AND (modulos ? 'aula-virtual' OR modulos ? 'aula-virtual-admin')
+      RETURNING id, usuario`);
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      clavesActualizadas: perm.rows.map(r => r.clave),
+      usuariosActualizados: usr.rows.map(r => r.usuario),
+    });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('❌ POST /permisos/revocar-aula-virtual', e);
+    res.status(500).json({ success: false, message: e.message });
+  } finally { client.release(); }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 📋 GESTIÓN REALZZA → PostgreSQL (Neon). Reemplaza el Google Form de campo.
 // La tabla guarda las 29 columnas del form + marca_temporal (real) + origen.
