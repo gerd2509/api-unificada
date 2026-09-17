@@ -1639,13 +1639,23 @@ function streamJsonRows(res, rows, mapFn) {
 }
 
 // GET /gestion-realzza?desde=&hasta= — filas con las cabeceras de la hoja.
+// ⚠️ Sin desde/hasta, esta tabla ya pesa >57MB (y crece a diario) — cargarla completa en
+// memoria del proceso puede tumbarlo (heap OOM, el mismo caso que /gestion). 4 pantallas
+// (Agendamientos Call/KOMMO/Campo, Control Supervisor) la llaman sin filtro vía los alias
+// getSheetData()/getSheetDataCampo(); por eso se acota por defecto a los últimos 90 días.
 app.get('/gestion-realzza', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureGestionRealzzaSchema();
+    let desde = req.query.desde ? String(req.query.desde) : '';
+    const hasta = req.query.hasta ? String(req.query.hasta) : '';
+    if (!desde && !hasta) {
+      const d = new Date(); d.setDate(d.getDate() - 90);
+      desde = d.toISOString().slice(0, 10);
+    }
     const cond = []; const params = [];
-    if (req.query.desde) { params.push(`${req.query.desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
-    if (req.query.hasta) { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
+    if (desde) { params.push(`${desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
+    if (hasta) { params.push(`${hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(
       `SELECT * FROM gestion_realzza ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
@@ -1887,13 +1897,21 @@ app.post('/gestion-call', async (req, res) => {
   } catch (e) { console.error('❌ POST /gestion-call:', e); res.status(500).json({ success: false, message: 'No se pudo guardar la gestión.' }); }
 });
 
+// ⚠️ Igual que /gestion-realzza: sin desde/hasta esta tabla (aún más grande) puede tumbar
+// el proceso. Se acota por defecto a los últimos 90 días.
 app.get('/gestion-call', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureGestionCallSchema();
+    let desde = req.query.desde ? String(req.query.desde) : '';
+    const hasta = req.query.hasta ? String(req.query.hasta) : '';
+    if (!desde && !hasta) {
+      const d = new Date(); d.setDate(d.getDate() - 90);
+      desde = d.toISOString().slice(0, 10);
+    }
     const cond = []; const params = [];
-    if (req.query.desde) { params.push(`${req.query.desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
-    if (req.query.hasta) { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
+    if (desde) { params.push(`${desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
+    if (hasta) { params.push(`${hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(`SELECT * FROM gestion_call ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
     streamJsonRows(res, rows, gcRowToSheet);
