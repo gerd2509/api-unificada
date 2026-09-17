@@ -829,14 +829,23 @@ app.post('/gestion-kommo', async (req, res) => {
 });
 
 // GET /gestion-kommo?canal=&desde=&hasta=&asesor=&shape=sheet
+// ⚠️ Sin ningún filtro (ni siquiera lead-mes/año), esta tabla ya pesa >14MB y crece a
+// diario: se acota por defecto a los últimos 90 días para evitar el mismo riesgo de heap
+// OOM que /gestion-call y /gestion-realzza (getSheetKOMMO() la llama sin filtro alguno).
 app.get('/gestion-kommo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureGestionKommoSchema();
+    let desde = req.query.desde ? String(req.query.desde) : '';
+    let hasta = req.query.hasta ? String(req.query.hasta) : '';
+    if (!desde && !hasta && !req.query.canal && !req.query.asesor && !(req.query.leadMes && req.query.leadAnio)) {
+      const d = new Date(); d.setDate(d.getDate() - 90);
+      desde = d.toISOString().slice(0, 10);
+    }
     const cond = []; const params = [];
     if (req.query.canal)  { params.push(String(req.query.canal).toUpperCase()); cond.push(`UPPER(canal) = $${params.length}`); }
-    if (req.query.desde)  { params.push(`${req.query.desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
-    if (req.query.hasta)  { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
+    if (desde)  { params.push(`${desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
+    if (hasta)  { params.push(`${hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
     if (req.query.asesor) { params.push(String(req.query.asesor).trim()); cond.push(`asesor ILIKE $${params.length}`); }
     // Filtro por FECHA DE LEAD ASIGNADO (texto d/m/aaaa) por mes+año — para Embudos.
     if (req.query.leadMes && req.query.leadAnio) {
