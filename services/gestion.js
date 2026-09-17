@@ -647,13 +647,22 @@ app.post('/control-supervisor', async (req, res) => {
 });
 
 // GET /control-supervisor?desde=&hasta= — controles del supervisor por rango de fechas.
+// ⚠️ Sin filtro, firma la URL de las fotos de TODO el histórico (una llamada a Supabase
+// Storage por foto) — de ahí la demora de ~18s medida sin desde/hasta. Se acota por
+// defecto a los últimos 90 días.
 app.get('/control-supervisor', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureControlSupervisorSchema();
+    let desde = req.query.desde ? String(req.query.desde) : '';
+    const hasta = req.query.hasta ? String(req.query.hasta) : '';
+    if (!desde && !hasta) {
+      const d = new Date(); d.setDate(d.getDate() - 90);
+      desde = d.toISOString().slice(0, 10);
+    }
     const cond = []; const params = [];
-    if (req.query.desde) { params.push(`${req.query.desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
-    if (req.query.hasta) { params.push(`${req.query.hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
+    if (desde) { params.push(`${desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
+    if (hasta) { params.push(`${hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(
       `SELECT * FROM control_supervisor ${where} ORDER BY marca_temporal DESC NULLS LAST`, params);
