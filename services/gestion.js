@@ -299,6 +299,11 @@ app.post('/gestion/sync-sedes', async (req, res) => {
 });
 
 // GET /gestion?desde=&hasta=&sede= — lista la gestión de sedes desde la BD (fuente única).
+// ⚠️ La tabla `gestion` tiene cientos de miles de filas y crece a diario: sin límite de
+// rango, un caller que olvide mandar desde/hasta (o los mande vacíos) tumba el proceso por
+// "heap out of memory" (ya pasó: un componente del front pedía /gestion sin parámetros y
+// cargaba la tabla entera). Por eso, si no viene un rango explícito, se acota por defecto
+// a los últimos 60 días — nunca se sirve la tabla completa sin filtro.
 app.get('/gestion', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
@@ -309,9 +314,15 @@ app.get('/gestion', async (req, res) => {
     // (antes se hacía COALESCE con creado_en, pero esa expresión no era indexable → Seq
     // Scan). Ahora el filtro por `marca_temporal::date` usa el índice ix_gestion_marca_dia.
     const FECHA = `marca_temporal`;
+    let desde = req.query.desde ? String(req.query.desde) : '';
+    const hasta = req.query.hasta ? String(req.query.hasta) : '';
+    if (!desde && !hasta) {
+      const d = new Date(); d.setDate(d.getDate() - 30);
+      desde = d.toISOString().slice(0, 10);
+    }
     const cond = [], params = [];
-    if (req.query.desde) { params.push(String(req.query.desde)); cond.push(`${FECHA}::date >= $${params.length}`); }
-    if (req.query.hasta) { params.push(String(req.query.hasta)); cond.push(`${FECHA}::date <= $${params.length}`); }
+    if (desde) { params.push(desde); cond.push(`${FECHA}::date >= $${params.length}`); }
+    if (hasta) { params.push(hasta); cond.push(`${FECHA}::date <= $${params.length}`); }
     if (req.query.sede)  { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(
