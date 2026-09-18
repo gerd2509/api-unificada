@@ -335,6 +335,40 @@ app.get('/gestion', async (req, res) => {
   } catch (e) { console.error('❌ GET /gestion:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /gestion/evolucion?desde=&hasta= — agregado por día+sede (llamadas/cartas, en SQL)
+// + lista de (sede, asesor) distintos del rango. Para "Evolución por Rango" de Control
+// Gestión Sede: antes ese gráfico pedía TODAS las filas crudas del rango (con "todo el
+// año" son cientos de miles) y las contaba en el navegador → heap OOM. Acá se cuenta en
+// SQL y se manda un puñado de filas (una por día×sede), sin importar qué tan largo sea
+// el rango pedido.
+app.get('/evolucion', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureGestionSchema();
+    const desde = req.query.desde ? String(req.query.desde) : '';
+    const hasta = req.query.hasta ? String(req.query.hasta) : '';
+    if (!desde || !hasta) return res.status(400).json({ success: false, message: 'Faltan desde/hasta.' });
+    const [porDia, asesores] = await Promise.all([
+      pgPool.query(
+        `SELECT to_char(marca_temporal::date, 'YYYY-MM-DD') AS dia, sede,
+                COUNT(*) FILTER (WHERE tipo_gestion ILIKE '%llamada%')::int AS llamadas,
+                COUNT(*) FILTER (WHERE tipo_gestion ILIKE '%carta%')::int AS cartas
+         FROM gestion
+         WHERE marca_temporal::date >= $1 AND marca_temporal::date <= $2
+         GROUP BY marca_temporal::date, sede
+         ORDER BY marca_temporal::date`, [desde, hasta]),
+      pgPool.query(
+        `SELECT DISTINCT sede, asesor FROM gestion
+         WHERE marca_temporal::date >= $1 AND marca_temporal::date <= $2
+           AND asesor IS NOT NULL AND asesor <> ''`, [desde, hasta]),
+    ]);
+    res.json({
+      porDia: porDia.rows.map(r => ({ dia: r.dia, sede: r.sede, llamadas: r.llamadas, cartas: r.cartas })),
+      asesores: asesores.rows,
+    });
+  } catch (e) { console.error('❌ GET /gestion/evolucion:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // PUT /gestion/:id — edita una gestión (módulo Gestión Sede, como gestion-call/realzza).
 app.put('/gestion/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
