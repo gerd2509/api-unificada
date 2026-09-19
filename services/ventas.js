@@ -2132,10 +2132,13 @@ app.get('/avance-vendedor', async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 🌎 REPORTE GLOBAL (módulo "Reporte Global") — consolidado por sede.
-// GET /reporte-global?anio=&mes= → monto NETO + # operaciones por (sede, entidad, es_moto)
+// GET /reporte-global?anio=&mes= → monto NETO + # operaciones NETAS por (sede, entidad, es_moto)
 //   entidad = tal cual (LEONCITO / GLOBAL GO / BRILLA / EFECTIVA); el front separa
 //             aliados (≠LEONCITO) y motos (es_moto) propio(LEONCITO)/GLOBAL GO.
 //   neto = ventas − NC arrastradas − incaut. arrastradas (mismas reglas que /avance-sedes).
+//   ops  = igual, pero en UNIDADES (antes solo se netaba el monto; el conteo de "ops"
+//   quedaba bruto sin descontar las canceladas/incautadas, por eso no cuadraba con
+//   /reporte-global-motos, que sí resta unidades — mismo dato, dos criterios distintos).
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/reporte-global', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -2154,16 +2157,16 @@ app.get('/reporte-global', async (req, res) => {
       ven AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
         WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
           AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) GROUP BY sede, entidad, es_moto),
-      nc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto FROM ent
+      nc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
         WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
           AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af) GROUP BY sede, entidad, es_moto),
-      inc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto FROM ent
+      inc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
         WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
           AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af) GROUP BY sede, entidad, es_moto),
       claves AS (SELECT sede, entidad, es_moto FROM ven UNION SELECT sede, entidad, es_moto FROM nc UNION SELECT sede, entidad, es_moto FROM inc)
       SELECT k.sede, k.entidad, k.es_moto,
         ROUND(COALESCE(ven.monto,0) - COALESCE(nc.monto,0) - COALESCE(inc.monto,0))::int AS neto,
-        COALESCE(ven.ops,0)::int AS ops
+        GREATEST(COALESCE(ven.ops,0) - COALESCE(nc.ops,0) - COALESCE(inc.ops,0), 0)::int AS ops
       FROM claves k
       LEFT JOIN ven ON ven.sede=k.sede AND ven.entidad IS NOT DISTINCT FROM k.entidad AND ven.es_moto=k.es_moto
       LEFT JOIN nc  ON nc.sede=k.sede  AND nc.entidad IS NOT DISTINCT FROM k.entidad  AND nc.es_moto=k.es_moto
