@@ -2255,6 +2255,99 @@ app.get('/margen-linea-sede', async (req, res) => {
   } catch (e) { console.error('❌ GET /margen-linea-sede:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// GET /ventas-linea-asesor?canal=CALL|REALZZA&anioDesde=&mesDesde=&anioHasta=&mesHasta=
+//   Ventas netas (− NC/incautaciones arrastradas) por ASESOR × MES × categoría de
+//   línea (MOTOS / MELAMINA / RESTO), para el módulo "Ventas por Línea".
+//   · CALL: asesor = asesor_venta (código CC de la atribución); solo sedes de piso.
+//   · REALZZA: asesor = vendedor (nombre directo); solo SEDE REALZZA STORE.
+//   · Categoría: se usa margen_ventas.linea_real cuando existe (preciso, meses
+//     cerrados); si la venta aún no tiene margen (mes en curso, margen se actualiza
+//     con rezago), se aproxima por estado_tipo_producto/productos — de ahí que el
+//     mes en curso venga marcado como "proyección" en `mesesProyeccion`.
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/ventas-linea-asesor', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureVentasSchema();
+    const canal = (req.query.canal || 'CALL').toString().toUpperCase();
+    const hoy = new Date();
+    const anioDesde = parseInt(req.query.anioDesde, 10) || hoy.getFullYear();
+    const mesDesde = parseInt(req.query.mesDesde, 10) || 1;
+    const anioHasta = parseInt(req.query.anioHasta, 10) || hoy.getFullYear();
+    const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
+    const esRealzza = canal === 'REALZZA';
+
+    const rows = await cached(`ventas-linea-asesor|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh, async () => (await pgPool.query(`
+      WITH base AS (
+        SELECT v.codigo_cv, v.estado_venta, v.monto_consolidado, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
+          ${esRealzza ? 'UPPER(TRIM(v.vendedor))' : 'v.asesor_venta'} AS asesor_key,
+          mv.linea_real, v.estado_tipo_producto, v.productos
+        FROM ventas v
+        LEFT JOIN margen_ventas mv ON mv.codigo_cv = v.codigo_cv
+        WHERE ${esRealzza
+          ? `v.sede ILIKE '%REALZZA%'`
+          : `v.sede NOT ILIKE '%REALZZA%' AND v.asesor_venta IS NOT NULL AND v.asesor_venta <> ''`}
+      ),
+      cat AS (
+        SELECT *,
+          CASE
+            WHEN linea_real ILIKE '%motocic%' THEN 'MOTOS'
+            WHEN linea_real ILIKE '%melamina%' THEN 'MELAMINA'
+            WHEN linea_real IS NOT NULL THEN 'RESTO'
+            WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%' THEN 'MOTOS'
+            WHEN estado_tipo_producto = 'SKU'
+              OR UPPER(COALESCE(productos,'')) ~ '(LEO SKU|DSK\\.|ROPERO|MODULAR|JUEGO DE (SALA|COMEDOR)|VELADOR|REPISA|APARADOR|COMODA|TARIMA|CABECERA)'
+              THEN 'MELAMINA'
+            ELSE 'RESTO'
+          END AS categoria
+        FROM base
+      ),
+      ven AS (
+        SELECT asesor_key, anio_cv AS anio, mes_cv AS mes, categoria,
+          SUM(monto_consolidado) AS monto, COUNT(*)::int AS ops
+        FROM cat
+        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+          AND monto_consolidado > 0 AND asesor_key IS NOT NULL
+          AND (anio_cv, mes_cv) >= ($1::int, $2::int) AND (anio_cv, mes_cv) <= ($3::int, $4::int)
+        GROUP BY 1, 2, 3, 4
+      ),
+      canc AS (
+        SELECT asesor_key, anio_af AS anio, mes_af AS mes, categoria,
+          SUM(monto_consolidado) AS monto, COUNT(*)::int AS ops
+        FROM cat
+        WHERE (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
+          AND asesor_key IS NOT NULL
+          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
+          AND (anio_af, mes_af) >= ($1::int, $2::int) AND (anio_af, mes_af) <= ($3::int, $4::int)
+        GROUP BY 1, 2, 3, 4
+      ),
+      claves AS (SELECT asesor_key, anio, mes, categoria FROM ven UNION SELECT asesor_key, anio, mes, categoria FROM canc)
+      SELECT k.asesor_key AS asesor, k.anio, k.mes, k.categoria,
+        ROUND(COALESCE(v.monto,0) - COALESCE(c.monto,0))::int AS monto,
+        GREATEST(COALESCE(v.ops,0) - COALESCE(c.ops,0), 0)::int AS ops
+      FROM claves k
+      LEFT JOIN ven  v ON v.asesor_key=k.asesor_key AND v.anio=k.anio AND v.mes=k.mes AND v.categoria=k.categoria
+      LEFT JOIN canc c ON c.asesor_key=k.asesor_key AND c.anio=k.anio AND c.mes=k.mes AND c.categoria=k.categoria
+      ORDER BY k.asesor_key, k.anio, k.mes`,
+      [anioDesde, mesDesde, anioHasta, mesHasta])).rows);
+
+    // Meses "proyección": el mes aún no está cubierto del todo por margen_ventas
+    // (se actualiza con rezago) → su Motos/Melamina se aproxima por texto, no exacto.
+    const { rows: mvRows } = await pgPool.query(`SELECT MAX(fecha) AS ultima FROM margen_ventas`);
+    const ultima = mvRows[0]?.ultima ? new Date(mvRows[0].ultima) : null;
+    const mesesProyeccion = [];
+    const totalDesde = anioDesde * 12 + (mesDesde - 1);
+    const totalHasta = anioHasta * 12 + (mesHasta - 1);
+    for (let t = totalDesde; t <= totalHasta; t++) {
+      const a = Math.floor(t / 12), m = (t % 12) + 1;
+      const finMes = new Date(a, m, 0);   // último día del mes
+      if (!ultima || finMes > ultima) mesesProyeccion.push(`${a}-${String(m).padStart(2, '0')}`);
+    }
+    res.json({ rows, mesesProyeccion });
+  } catch (e) { console.error('❌ GET /ventas-linea-asesor:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // Metas editables por sede (cuadros General y Motos del módulo Avance de Metas).
 // clave: 'general:<sedeNorm>' | 'motos:<sedeNorm>'.
 let metasAvanceLista = false;
