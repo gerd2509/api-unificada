@@ -2279,22 +2279,41 @@ app.get('/ventas-linea-asesor', async (req, res) => {
     const esRealzza = canal === 'REALZZA';
 
     const rows = await cached(`ventas-linea-asesor|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh, async () => (await pgPool.query(`
-      WITH base AS (
+      WITH margen_cv AS (
+        -- margen_ventas es por LÍNEA DE PRODUCTO (varias filas por codigo_cv, hasta
+        -- 20+ en ventas con muchos ítems) — se agrega a 1 fila por venta ANTES de
+        -- unir con ventas, para no duplicar monto_consolidado por cada línea.
+        SELECT codigo_cv,
+          SUM(valor_venta) FILTER (WHERE linea_real ILIKE '%motocic%')  AS v_motos,
+          SUM(valor_venta) FILTER (WHERE linea_real ILIKE '%melamina%') AS v_melamina,
+          SUM(valor_venta) AS v_total
+        FROM margen_ventas
+        GROUP BY codigo_cv
+      ),
+      base AS (
         SELECT v.codigo_cv, v.estado_venta, v.monto_consolidado, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
           ${esRealzza ? 'UPPER(TRIM(v.vendedor))' : 'v.asesor_venta'} AS asesor_key,
-          mv.linea_real, v.estado_tipo_producto, v.productos
+          mc.v_motos, mc.v_melamina, mc.v_total, v.estado_tipo_producto, v.productos
         FROM ventas v
-        LEFT JOIN margen_ventas mv ON mv.codigo_cv = v.codigo_cv
+        LEFT JOIN margen_cv mc ON mc.codigo_cv = v.codigo_cv
         WHERE ${esRealzza
           ? `v.sede ILIKE '%REALZZA%'`
           : `v.sede NOT ILIKE '%REALZZA%' AND v.asesor_venta IS NOT NULL AND v.asesor_venta <> ''`}
       ),
       cat AS (
+        -- Con margen: la venta se clasifica ENTERA (con su monto_consolidado real, no
+        -- el de margen) en la categoría con más valor entre sus líneas — la venta
+        -- cuenta una sola vez, sin fraccionar ni duplicar. Sin margen aún (mes en
+        -- curso): se aproxima por estado_tipo_producto/productos.
         SELECT *,
           CASE
-            WHEN linea_real ILIKE '%motocic%' THEN 'MOTOS'
-            WHEN linea_real ILIKE '%melamina%' THEN 'MELAMINA'
-            WHEN linea_real IS NOT NULL THEN 'RESTO'
+            WHEN v_total IS NOT NULL AND COALESCE(v_motos,0) >= COALESCE(v_melamina,0)
+                 AND COALESCE(v_motos,0) >= (v_total - COALESCE(v_motos,0) - COALESCE(v_melamina,0)) AND COALESCE(v_motos,0) > 0
+              THEN 'MOTOS'
+            WHEN v_total IS NOT NULL AND COALESCE(v_melamina,0) > COALESCE(v_motos,0)
+                 AND COALESCE(v_melamina,0) >= (v_total - COALESCE(v_motos,0) - COALESCE(v_melamina,0)) AND COALESCE(v_melamina,0) > 0
+              THEN 'MELAMINA'
+            WHEN v_total IS NOT NULL THEN 'RESTO'
             WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%' THEN 'MOTOS'
             WHEN estado_tipo_producto = 'SKU'
               OR UPPER(COALESCE(productos,'')) ~ '(LEO SKU|DSK\\.|ROPERO|MODULAR|JUEGO DE (SALA|COMEDOR)|VELADOR|REPISA|APARADOR|COMODA|TARIMA|CABECERA)'
