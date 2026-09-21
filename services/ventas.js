@@ -2257,19 +2257,25 @@ app.get('/margen-linea-sede', async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /ventas-linea-asesor?canal=CALL|REALZZA&anioDesde=&mesDesde=&anioHasta=&mesHasta=
-//   Ventas netas (− NC/incautaciones arrastradas) por ASESOR × MES × categoría de
-//   línea (MOTOS / MELAMINA / RESTO), para el módulo "Ventas por Línea".
-//   · CALL: asesor = asesor_venta (código CC de la atribución); solo sedes de piso.
-//   · REALZZA: asesor = vendedor (nombre directo); solo SEDE REALZZA STORE.
+//   Monto por ASESOR × MES × categoría de línea (MOTOS / MELAMINA / RESTO), para el
+//   módulo "Ventas por Línea". Debe cuadrar con el monto que YA muestran los módulos
+//   de referencia de cada canal, así que cada uno replica su fuente y sus reglas:
+//   · CALL: lee `ventas_call` (el histórico consolidado que usa el módulo "Ventas"),
+//     NO `ventas` directo — ventas_call ya incluye lo cerrado en Realzza pero
+//     atribuido a un asesor de Call, y aplica sus propias reglas (excluye NAS,
+//     excluye CC12/Brenda desde set-2026, solo excluye NOTA DE CRÉDITO — igual que
+//     `ventas.component.ts`). El código de asesor es la columna `vendedor`.
+//   · REALZZA: lee `ventas` (sede REALZZA STORE), con neteo de NC/incautaciones
+//     arrastradas — igual que antes (ya validado).
 //   · Categoría: se usa margen_ventas.linea_real cuando existe (preciso, meses
 //     cerrados); si la venta aún no tiene margen (mes en curso, margen se actualiza
-//     con rezago), se aproxima por estado_tipo_producto/productos — de ahí que el
-//     mes en curso venga marcado como "proyección" en `mesesProyeccion`.
+//     con rezago), se aproxima por producto — de ahí el mes marcado "proyección".
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/ventas-linea-asesor', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
+    await ensureCanalSchema('call');
     const canal = (req.query.canal || 'CALL').toString().toUpperCase();
     const hoy = new Date();
     const anioDesde = parseInt(req.query.anioDesde, 10) || hoy.getFullYear();
@@ -2278,50 +2284,42 @@ app.get('/ventas-linea-asesor', async (req, res) => {
     const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
     const esRealzza = canal === 'REALZZA';
 
-    const rows = await cached(`ventas-linea-asesor|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh, async () => (await pgPool.query(`
+    // CASE de categoría (idéntico en ambas ramas): margen agregado por codigo_cv
+    // (margen_ventas es por LÍNEA DE PRODUCTO, varias filas por venta — se agrega
+    // ANTES de unir para no duplicar el monto real de la venta).
+    const CAT_CASE = `
+      CASE
+        WHEN v_total IS NOT NULL AND COALESCE(v_motos,0) >= COALESCE(v_melamina,0)
+             AND COALESCE(v_motos,0) >= (v_total - COALESCE(v_motos,0) - COALESCE(v_melamina,0)) AND COALESCE(v_motos,0) > 0
+          THEN 'MOTOS'
+        WHEN v_total IS NOT NULL AND COALESCE(v_melamina,0) > COALESCE(v_motos,0)
+             AND COALESCE(v_melamina,0) >= (v_total - COALESCE(v_motos,0) - COALESCE(v_melamina,0)) AND COALESCE(v_melamina,0) > 0
+          THEN 'MELAMINA'
+        WHEN v_total IS NOT NULL THEN 'RESTO'
+        WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%' THEN 'MOTOS'
+        WHEN estado_tipo_producto = 'SKU'
+          OR UPPER(COALESCE(productos,'')) ~ '(LEO SKU|DSK\\.|ROPERO|MODULAR|JUEGO DE (SALA|COMEDOR)|VELADOR|REPISA|APARADOR|COMODA|TARIMA|CABECERA)'
+          THEN 'MELAMINA'
+        ELSE 'RESTO'
+      END`;
+
+    const sql = esRealzza ? `
       WITH margen_cv AS (
-        -- margen_ventas es por LÍNEA DE PRODUCTO (varias filas por codigo_cv, hasta
-        -- 20+ en ventas con muchos ítems) — se agrega a 1 fila por venta ANTES de
-        -- unir con ventas, para no duplicar monto_consolidado por cada línea.
         SELECT codigo_cv,
           SUM(valor_venta) FILTER (WHERE linea_real ILIKE '%motocic%')  AS v_motos,
           SUM(valor_venta) FILTER (WHERE linea_real ILIKE '%melamina%') AS v_melamina,
           SUM(valor_venta) AS v_total
-        FROM margen_ventas
-        GROUP BY codigo_cv
+        FROM margen_ventas GROUP BY codigo_cv
       ),
       base AS (
         SELECT v.codigo_cv, v.estado_venta, v.monto_consolidado, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
-          ${esRealzza ? 'UPPER(TRIM(v.vendedor))' : 'v.asesor_venta'} AS asesor_key,
+          UPPER(TRIM(v.vendedor)) AS asesor_key,
           mc.v_motos, mc.v_melamina, mc.v_total, v.estado_tipo_producto, v.productos
         FROM ventas v
         LEFT JOIN margen_cv mc ON mc.codigo_cv = v.codigo_cv
-        WHERE ${esRealzza
-          ? `v.sede ILIKE '%REALZZA%'`
-          : `v.sede NOT ILIKE '%REALZZA%' AND v.asesor_venta IS NOT NULL AND v.asesor_venta <> ''`}
+        WHERE v.sede ILIKE '%REALZZA%'
       ),
-      cat AS (
-        -- Con margen: la venta se clasifica ENTERA (con su monto_consolidado real, no
-        -- el de margen) en la categoría con más valor entre sus líneas — la venta
-        -- cuenta una sola vez, sin fraccionar ni duplicar. Sin margen aún (mes en
-        -- curso): se aproxima por estado_tipo_producto/productos.
-        SELECT *,
-          CASE
-            WHEN v_total IS NOT NULL AND COALESCE(v_motos,0) >= COALESCE(v_melamina,0)
-                 AND COALESCE(v_motos,0) >= (v_total - COALESCE(v_motos,0) - COALESCE(v_melamina,0)) AND COALESCE(v_motos,0) > 0
-              THEN 'MOTOS'
-            WHEN v_total IS NOT NULL AND COALESCE(v_melamina,0) > COALESCE(v_motos,0)
-                 AND COALESCE(v_melamina,0) >= (v_total - COALESCE(v_motos,0) - COALESCE(v_melamina,0)) AND COALESCE(v_melamina,0) > 0
-              THEN 'MELAMINA'
-            WHEN v_total IS NOT NULL THEN 'RESTO'
-            WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%' THEN 'MOTOS'
-            WHEN estado_tipo_producto = 'SKU'
-              OR UPPER(COALESCE(productos,'')) ~ '(LEO SKU|DSK\\.|ROPERO|MODULAR|JUEGO DE (SALA|COMEDOR)|VELADOR|REPISA|APARADOR|COMODA|TARIMA|CABECERA)'
-              THEN 'MELAMINA'
-            ELSE 'RESTO'
-          END AS categoria
-        FROM base
-      ),
+      cat AS (SELECT *, ${CAT_CASE} AS categoria FROM base),
       ven AS (
         SELECT asesor_key, anio_cv AS anio, mes_cv AS mes, categoria,
           SUM(monto_consolidado) AS monto, COUNT(*)::int AS ops
@@ -2348,8 +2346,40 @@ app.get('/ventas-linea-asesor', async (req, res) => {
       FROM claves k
       LEFT JOIN ven  v ON v.asesor_key=k.asesor_key AND v.anio=k.anio AND v.mes=k.mes AND v.categoria=k.categoria
       LEFT JOIN canc c ON c.asesor_key=k.asesor_key AND c.anio=k.anio AND c.mes=k.mes AND c.categoria=k.categoria
-      ORDER BY k.asesor_key, k.anio, k.mes`,
-      [anioDesde, mesDesde, anioHasta, mesHasta])).rows);
+      ORDER BY k.asesor_key, k.anio, k.mes`
+      : `
+      WITH margen_cv AS (
+        SELECT codigo_cv,
+          SUM(valor_venta) FILTER (WHERE linea_real ILIKE '%motocic%')  AS v_motos,
+          SUM(valor_venta) FILTER (WHERE linea_real ILIKE '%melamina%') AS v_melamina,
+          SUM(valor_venta) AS v_total
+        FROM margen_ventas GROUP BY codigo_cv
+      ),
+      base AS (
+        -- ventas_call = histórico consolidado (botón "Consolidar → Ventas Call"), la
+        -- MISMA fuente que el módulo "Ventas". No tiene anio_af/mes_af reales (se
+        -- congelan iguales a anio_cv/mes_cv al consolidar) → sin neteo de arrastradas,
+        -- igual que ventas.component.ts (solo excluye NOTA DE CRÉDITO, no incautación).
+        SELECT vc.codigo_cv, vc.estado_venta, vc.monto_consolidado, vc.anio_cv, vc.mes_cv,
+          UPPER(TRIM(vc.vendedor)) AS asesor_key,
+          mc.v_motos, mc.v_melamina, mc.v_total, vc.tipo_producto AS estado_tipo_producto, vc.productos
+        FROM ventas_call vc
+        LEFT JOIN margen_cv mc ON mc.codigo_cv = vc.codigo_cv
+        WHERE UPPER(COALESCE(vc.vendedor,'')) NOT IN ('', 'NAS')
+          AND NOT (UPPER(COALESCE(vc.vendedor,'')) = 'CC12' AND (vc.anio_cv > 2026 OR (vc.anio_cv = 2026 AND vc.mes_cv >= 9)))
+      ),
+      cat AS (SELECT *, ${CAT_CASE} AS categoria FROM base)
+      SELECT asesor_key AS asesor, anio_cv AS anio, mes_cv AS mes, categoria,
+        ROUND(SUM(monto_consolidado))::int AS monto, COUNT(*)::int AS ops
+      FROM cat
+      WHERE UPPER(COALESCE(estado_venta,'')) NOT IN ('NOTA DE CRÉDITO', 'NOTA DE CREDITO')
+        AND monto_consolidado > 0
+        AND (anio_cv, mes_cv) >= ($1::int, $2::int) AND (anio_cv, mes_cv) <= ($3::int, $4::int)
+      GROUP BY 1, 2, 3, 4
+      ORDER BY 1, 2, 3`;
+
+    const rows = await cached(`ventas-linea-asesor|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh,
+      async () => (await pgPool.query(sql, [anioDesde, mesDesde, anioHasta, mesHasta])).rows);
 
     // Meses "proyección": el mes aún no está cubierto del todo por margen_ventas
     // (se actualiza con rezago) → su Motos/Melamina se aproxima por texto, no exacto.
