@@ -1642,14 +1642,18 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
         FROM cat
         WHERE grupo IS NOT NULL
           AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+          AND UPPER(COALESCE(estado_venta,'')) <> 'PRONTO PAGO'
           AND (anio_cv, mes_cv) >= ($2::int, $3::int) AND (anio_cv, mes_cv) <= ($4::int, $5::int)
         GROUP BY 1, 2, 3
       ),
       canc AS (
+        -- PRONTO PAGO: misma venta re-estampada con su propio mes_af (ajuste liquidado
+        -- después) — mismo criterio que NOTA DE CRÉDITO/INCAUTACIÓN (ver ventas-campo).
         SELECT anio_af AS anio, mes_af AS mes, grupo, COUNT(*)::int AS ops
         FROM cat
         WHERE grupo IS NOT NULL
-          AND (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
+          AND (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%'
+               OR UPPER(COALESCE(estado_venta,'')) = 'PRONTO PAGO')
           AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
           AND (anio_af, mes_af) >= ($2::int, $3::int) AND (anio_af, mes_af) <= ($4::int, $5::int)
         GROUP BY 1, 2, 3
@@ -1679,20 +1683,26 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
     const { rows } = await pgPool.query(`
       WITH meses AS (
         SELECT DISTINCT anio_cv AS anio, mes_cv AS mes FROM ventas_realzza
-        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND monto_consolidado > 0
+        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+          AND UPPER(COALESCE(estado_venta,'')) <> 'PRONTO PAGO' AND monto_consolidado > 0
           AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL
       ),
       ven AS (
         SELECT anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
-        WHERE sede ILIKE '%REALZZA%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND monto_consolidado > 0
+        WHERE sede ILIKE '%REALZZA%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%'
+          AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%' AND UPPER(COALESCE(estado_venta,'')) <> 'PRONTO PAGO'
+          AND monto_consolidado > 0
         GROUP BY anio_cv, mes_cv
       ),
       ncnr AS (
-        -- NC que restan: SOLO las "arrastradas" (venta de un mes anterior anulada este mes,
-        -- CV ≠ AF). Las NC del MISMO mes (CV=AF) netean a 0 (la venta se hizo y se anuló el
-        -- mismo mes; ya está incluida en el Monto total del módulo) → NO restan.
+        -- Restan SOLO las "arrastradas" (venta de un mes anterior anulada/liquidada este
+        -- mes, CV ≠ AF): NOTA DE CRÉDITO, INCAUTACIÓN y PRONTO PAGO (misma venta
+        -- re-estampada con su propio mes_af, ver ventas-campo.component.ts). Las del MISMO
+        -- mes (CV=AF) netean a 0 (ya excluidas de ven/meses) → no restan de nuevo.
         SELECT n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
-        WHERE n.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%'
+        WHERE n.sede ILIKE '%REALZZA%'
+          AND (UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(n.estado_venta,'')) LIKE '%INCAUTAC%'
+               OR UPPER(COALESCE(n.estado_venta,'')) = 'PRONTO PAGO')
           AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
           AND NOT (n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af)
         GROUP BY n.anio_af, n.mes_af
