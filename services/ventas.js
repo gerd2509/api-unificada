@@ -1594,6 +1594,78 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
   } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /ventas-realzza/motos-fuente?anioDesde=&mesDesde=&anioHasta=&mesHasta=
+//   Solo MOTOS (estado_tipo_producto LIKE '%MOTO%') de Realzza, operaciones NETAS
+//   (− NC/incautaciones arrastradas) por mes, agrupadas en 2 fuentes:
+//   · KOMMO   = tipo_base IN ('KOMMO', 'BBDD KOMMO')
+//   · MARKET PLACE = tipo_base = 'MARKET PLACE'
+//   tipo_base se resuelve IGUAL que /ventas-realzza/modulo (ventas_realzza, con
+//   fallback a 'CALL' por derivación — esas no caen en ninguno de los 2 grupos).
+app.get('/ventas-realzza/motos-fuente', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    const hoy = new Date();
+    const anioDesde = parseInt(req.query.anioDesde, 10) || hoy.getFullYear();
+    const mesDesde = parseInt(req.query.mesDesde, 10) || 1;
+    const anioHasta = parseInt(req.query.anioHasta, 10) || hoy.getFullYear();
+    const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
+
+    const rows = await cached(`ventas-realzza-motos-fuente|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh, async () => (await pgPool.query(`
+      WITH ${MAPA_SQL},
+      base AS (
+        SELECT v.codigo_cv, v.estado_venta, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
+          COALESCE(NULLIF(r.tipo_base,''),
+            CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END) AS tipo_base
+        FROM ventas v
+        LEFT JOIN ventas_realzza r ON r.codigo_cv = v.codigo_cv
+        LEFT JOIN LATERAL (
+          SELECT gc.asesor_contact FROM gestion_call gc
+          WHERE regexp_replace(gc.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+            AND gc.motivo_interes = ANY($1)
+            AND gc.marca_temporal::date <= v.fecha_cv
+            AND v.fecha_cv - gc.marca_temporal::date <= 31
+          ORDER BY gc.marca_temporal DESC LIMIT 1
+        ) g ON true
+        LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
+        WHERE v.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(v.estado_tipo_producto,'')) LIKE '%MOTO%'
+      ),
+      cat AS (
+        SELECT *,
+          CASE WHEN UPPER(COALESCE(tipo_base,'')) IN ('KOMMO', 'BBDD KOMMO') THEN 'KOMMO'
+               WHEN UPPER(COALESCE(tipo_base,'')) = 'MARKET PLACE' THEN 'MARKETPLACE'
+               ELSE NULL END AS grupo
+        FROM base
+      ),
+      ven AS (
+        SELECT anio_cv AS anio, mes_cv AS mes, grupo, COUNT(*)::int AS ops
+        FROM cat
+        WHERE grupo IS NOT NULL
+          AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+          AND (anio_cv, mes_cv) >= ($2::int, $3::int) AND (anio_cv, mes_cv) <= ($4::int, $5::int)
+        GROUP BY 1, 2, 3
+      ),
+      canc AS (
+        SELECT anio_af AS anio, mes_af AS mes, grupo, COUNT(*)::int AS ops
+        FROM cat
+        WHERE grupo IS NOT NULL
+          AND (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
+          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
+          AND (anio_af, mes_af) >= ($2::int, $3::int) AND (anio_af, mes_af) <= ($4::int, $5::int)
+        GROUP BY 1, 2, 3
+      ),
+      claves AS (SELECT anio, mes, grupo FROM ven UNION SELECT anio, mes, grupo FROM canc)
+      SELECT k.anio, k.mes, k.grupo,
+        GREATEST(COALESCE(v.ops,0) - COALESCE(c.ops,0), 0)::int AS ops
+      FROM claves k
+      LEFT JOIN ven  v ON v.anio=k.anio AND v.mes=k.mes AND v.grupo=k.grupo
+      LEFT JOIN canc c ON c.anio=k.anio AND c.mes=k.mes AND c.grupo=k.grupo
+      ORDER BY k.anio, k.mes, k.grupo`,
+      [DERIV_MOTIVOS, anioDesde, mesDesde, anioHasta, mesHasta])).rows);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-realzza/motos-fuente:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // GET /ventas-realzza/evolutivo — neto REAL mensual para el gráfico evolutivo.
 // Por mes = ventas (Realzza-store, por mes de venta) − NC NO refacturadas (por mes de AF).
 // Una NC es "refacturada" si el mismo cliente tiene otra venta (no NC) ese mismo mes → no
