@@ -1666,56 +1666,6 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
   } catch (e) { console.error('❌ GET /ventas-realzza/motos-fuente:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
-// GET /ventas-realzza/motos-entidad?anioDesde=&mesDesde=&anioHasta=&mesHasta=
-//   Solo MOTOS (estado_tipo_producto LIKE '%MOTO%') de Realzza, operaciones NETAS
-//   (− NC/incautaciones arrastradas) por mes, agrupadas por ENTIDAD (aliado/fuente
-//   de financiamiento, no el tipo_base de motos-fuente):
-//   · GLOBAL GO = entidad = 'GLOBAL GO'
-//   · PROPIO    = cualquier otra entidad (o vacía)
-app.get('/ventas-realzza/motos-entidad', async (req, res) => {
-  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
-  try {
-    await ensureAtribRealzza();
-    const hoy = new Date();
-    const anioDesde = parseInt(req.query.anioDesde, 10) || hoy.getFullYear();
-    const mesDesde = parseInt(req.query.mesDesde, 10) || 1;
-    const anioHasta = parseInt(req.query.anioHasta, 10) || hoy.getFullYear();
-    const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
-
-    const rows = await cached(`ventas-realzza-motos-entidad|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh, async () => (await pgPool.query(`
-      WITH base AS (
-        SELECT v.codigo_cv, v.estado_venta, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
-          CASE WHEN UPPER(COALESCE(v.entidad,'')) = 'GLOBAL GO' THEN 'GLOBAL GO' ELSE 'PROPIO' END AS grupo
-        FROM ventas v
-        WHERE v.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(v.estado_tipo_producto,'')) LIKE '%MOTO%'
-      ),
-      ven AS (
-        SELECT anio_cv AS anio, mes_cv AS mes, grupo, COUNT(*)::int AS ops
-        FROM base
-        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-          AND (anio_cv, mes_cv) >= ($1::int, $2::int) AND (anio_cv, mes_cv) <= ($3::int, $4::int)
-        GROUP BY 1, 2, 3
-      ),
-      canc AS (
-        SELECT anio_af AS anio, mes_af AS mes, grupo, COUNT(*)::int AS ops
-        FROM base
-        WHERE (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
-          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
-          AND (anio_af, mes_af) >= ($1::int, $2::int) AND (anio_af, mes_af) <= ($3::int, $4::int)
-        GROUP BY 1, 2, 3
-      ),
-      claves AS (SELECT anio, mes, grupo FROM ven UNION SELECT anio, mes, grupo FROM canc)
-      SELECT k.anio, k.mes, k.grupo,
-        GREATEST(COALESCE(v.ops,0) - COALESCE(c.ops,0), 0)::int AS ops
-      FROM claves k
-      LEFT JOIN ven  v ON v.anio=k.anio AND v.mes=k.mes AND v.grupo=k.grupo
-      LEFT JOIN canc c ON c.anio=k.anio AND c.mes=k.mes AND c.grupo=k.grupo
-      ORDER BY k.anio, k.mes, k.grupo`,
-      [anioDesde, mesDesde, anioHasta, mesHasta])).rows);
-    res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-realzza/motos-entidad:', e); res.status(500).json({ success: false, message: e.message }); }
-});
-
 // GET /ventas-realzza/evolutivo — neto REAL mensual para el gráfico evolutivo.
 // Por mes = ventas (Realzza-store, por mes de venta) − NC NO refacturadas (por mes de AF).
 // Una NC es "refacturada" si el mismo cliente tiene otra venta (no NC) ese mismo mes → no
