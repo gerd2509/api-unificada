@@ -664,28 +664,45 @@ function registrarCanal(canal, ruta) {
       if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`${vendCol} ILIKE $${params.length}`); }
       const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
 
-      // Realzza (joinAfect): sin_derivacion se calcula EN VIVO cruzando gestion_realzza
-      // (igual que /modulo y Atribución), NO desde la columna congelada de ventas_realzza.
+      // Realzza (joinAfect): sin_derivacion y tipo_base se calculan EN VIVO cruzando
+      // gestion_realzza/gestion_call (igual que /modulo y Atribución), NO desde la
+      // columna congelada de ventas_realzza (queda vacía hasta que se "Cruza").
+      let withClause = '';
       let derivLateral = '';
       let sinDerivExpr = 'r.sin_derivacion';
+      let tipoBaseExpr = `NULLIF(r.tipo_base,'')`;
       if (j) {
-        params.push(DERIV_MOTIVOS_RZ); const pmot = params.length;
+        params.push(DERIV_MOTIVOS_RZ); const pmotRz = params.length;
+        params.push(DERIV_MOTIVOS); const pmotCall = params.length;
+        withClause = `WITH ${MAPA_SQL} `;
         derivLateral = `
            LEFT JOIN LATERAL (
-             SELECT gr.marca_temporal FROM gestion_realzza gr
+             SELECT gr.marca_temporal, gr.tipo_base FROM gestion_realzza gr
              WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
-               AND gr.motivo_interes = ANY($${pmot})
+               AND gr.motivo_interes = ANY($${pmotRz})
                AND gr.marca_temporal::date <= v.fecha_cv
                AND v.fecha_cv - gr.marca_temporal::date <= 31
              ORDER BY gr.marca_temporal DESC LIMIT 1
-           ) grz ON true`;
+           ) grz ON true
+           LEFT JOIN LATERAL (
+             SELECT gc.asesor_contact FROM gestion_call gc
+             WHERE regexp_replace(gc.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+               AND gc.motivo_interes = ANY($${pmotCall})
+               AND gc.marca_temporal::date <= v.fecha_cv
+               AND v.fecha_cv - gc.marca_temporal::date <= 31
+             ORDER BY gc.marca_temporal DESC LIMIT 1
+           ) g ON true
+           LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre`;
         sinDerivExpr = '(grz.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8)))';
+        tipoBaseExpr = `COALESCE(NULLIF(r.tipo_base,''),
+                  CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END,
+                  NULLIF(grz.tipo_base,''))`;
       }
 
       const sql = j
-        ? `SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+        ? `${withClause}SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
                   v.doc_identidad, v.productos, v.cuotas, COALESCE(r.asesor_venta, v.asesor_venta) AS asesor_venta,
-                  v.vendedor, v.entidad, NULLIF(r.tipo_base,'') AS tipo_base, v.tipo_credito,
+                  v.vendedor, v.entidad, ${tipoBaseExpr} AS tipo_base, v.tipo_credito,
                   COALESCE(r.tipo_producto, v.estado_tipo_producto) AS tipo_producto,
                   ${sinDerivExpr} AS sin_derivacion, COALESCE(r.extranjero, false) AS extranjero,
                   COALESCE(r.asesor_manual, false) AS asesor_manual, v.fecha_cv,
@@ -1605,7 +1622,8 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
 //   · KOMMO   = tipo_base IN ('KOMMO', 'BBDD KOMMO')
 //   · MARKET PLACE = tipo_base = 'MARKET PLACE'
 //   tipo_base se resuelve IGUAL que /ventas-realzza/modulo (ventas_realzza, con
-//   fallback a 'CALL' por derivación — esas no caen en ninguno de los 2 grupos).
+//   fallback a 'CALL' por derivación Call, y si tampoco hay CALL, a la derivación
+//   Realzza vía gestion_realzza — misma que ve la Atribución de Ventas).
 app.get('/ventas-realzza/motos-fuente', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
@@ -1621,7 +1639,8 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
       base AS (
         SELECT v.codigo_cv, v.estado_venta, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
           COALESCE(NULLIF(r.tipo_base,''),
-            CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END) AS tipo_base
+            CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END,
+            NULLIF(grz.tipo_base, '')) AS tipo_base
         FROM ventas v
         LEFT JOIN ventas_realzza r ON r.codigo_cv = v.codigo_cv
         LEFT JOIN LATERAL (
@@ -1632,6 +1651,14 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
             AND v.fecha_cv - gc.marca_temporal::date <= 31
           ORDER BY gc.marca_temporal DESC LIMIT 1
         ) g ON true
+        LEFT JOIN LATERAL (
+          SELECT gr.tipo_base FROM gestion_realzza gr
+          WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+            AND gr.motivo_interes = ANY($6)
+            AND gr.marca_temporal::date <= v.fecha_cv
+            AND v.fecha_cv - gr.marca_temporal::date <= 31
+          ORDER BY gr.marca_temporal DESC LIMIT 1
+        ) grz ON true
         LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
         WHERE v.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(v.estado_tipo_producto,'')) LIKE '%MOTO%'
       ),
@@ -1666,7 +1693,7 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
       LEFT JOIN ven  v ON v.anio=k.anio AND v.mes=k.mes AND v.grupo=k.grupo
       LEFT JOIN canc c ON c.anio=k.anio AND c.mes=k.mes AND c.grupo=k.grupo
       ORDER BY k.anio, k.mes, k.grupo`,
-      [DERIV_MOTIVOS, anioDesde, mesDesde, anioHasta, mesHasta])).rows);
+      [DERIV_MOTIVOS, anioDesde, mesDesde, anioHasta, mesHasta, DERIV_MOTIVOS_RZ])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas-realzza/motos-fuente:', e); res.status(500).json({ success: false, message: e.message }); }
 });
