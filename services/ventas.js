@@ -1548,7 +1548,10 @@ app.delete('/meta-tipo-base/:id', async (req, res) => {
 //   • Estado (NC), fecha de afectación (dia/mes/anio_af), monto y entidad salen de `ventas`.
 //   • Una venta como NC → resta en su mes de AF; si no, cuenta en su mes de venta (CV).
 //   • TipoBase: respeta el de ventas_realzza (Realzza tal cual / CALL manual); si está
-//     vacío, marca 'CALL' por derivación Call — EXCEPTO Brenda (vende como Realzza).
+//     vacío, marca 'CALL' por derivación Call (gestion_call) — EXCEPTO Brenda (vende como
+//     Realzza); si tampoco hay CALL, usa la derivación Realzza (gestion_realzza, misma que
+//     ve la Atribución) — así una venta ya derivada en el módulo de Atribución pero aún no
+//     "Cruzada" (consolidada a la columna tipo_base) no se cuenta como "sin tipo de base".
 app.get('/ventas-realzza/modulo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
@@ -1569,7 +1572,8 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
              COALESCE(r.extranjero, false) AS extranjero,
              COALESCE(r.asesor_manual, false) AS asesor_manual,
              COALESCE(NULLIF(r.tipo_base,''),
-               CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END) AS tipo_base
+               CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END,
+               NULLIF(grz.tipo_base, '')) AS tipo_base
       FROM ventas v
       LEFT JOIN ventas_realzza r ON r.codigo_cv = v.codigo_cv
       LEFT JOIN LATERAL (
@@ -1581,7 +1585,7 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
         ORDER BY gc.marca_temporal DESC LIMIT 1
       ) g ON true
       LEFT JOIN LATERAL (
-        SELECT gr.marca_temporal FROM gestion_realzza gr
+        SELECT gr.marca_temporal, gr.tipo_base FROM gestion_realzza gr
         WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
           AND gr.motivo_interes = ANY($3)
           AND gr.marca_temporal::date <= v.fecha_cv
