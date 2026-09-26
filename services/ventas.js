@@ -1555,6 +1555,7 @@ app.delete('/meta-tipo-base/:id', async (req, res) => {
 app.get('/ventas-realzza/modulo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
+    res.set('Cache-Control', 'no-store');
     await ensureAtribRealzza();
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
     const rows = await cached(`realzza/modulo|${anio}`, req.query.fresh, async () => (await pgPool.query(`
