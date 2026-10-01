@@ -674,7 +674,7 @@ function registrarCanal(canal, ruta) {
       if (j) {
         params.push(DERIV_MOTIVOS_RZ); const pmotRz = params.length;
         params.push(DERIV_MOTIVOS); const pmotCall = params.length;
-        withClause = `WITH ${MAPA_SQL} `;
+        withClause = `WITH ${MAPA_SQL_CALL_ACTIVO} `;
         derivLateral = `
            LEFT JOIN LATERAL (
              SELECT gr.marca_temporal, gr.tipo_base FROM gestion_realzza gr
@@ -747,6 +747,15 @@ const ASESORES_CC = [
   ['BERNAL BAZAN FABRICIO ROLANDO', 'CC22'], ['RUIZ SAMPEN LUCRECIA NOEMI', 'CC26'],
 ];
 const MAPA_SQL = `mapa(nombre, cc) AS (VALUES ${ASESORES_CC.map(([n, c]) => `('${n.replace(/'/g, "''")}','${c}')`).join(',')})`;
+
+// Subconjunto de ASESORES_CC que SIGUE activo en Call Center (CC1, CC2, CC5, CC6, CC15,
+// CC19) — usado SOLO para decidir si una venta de Realzza se clasifica como tipo_base
+// 'CALL' (derivación de Call). Asesoras que pasaron a vender como Realzza (ej. Kelly
+// CC8, Anita CC21) ya NO deben agruparse en el bucket genérico "CALL": sus ventas/NC
+// deben restarle a ELLAS mismas, no al total de Call. El resto de /ventas-call/* (la
+// atribución propia del módulo Call) sigue usando ASESORES_CC completo — eso no cambia.
+const ASESORES_CC_CALL_ACTIVO = ASESORES_CC.filter(([, cc]) => ['CC1', 'CC2', 'CC5', 'CC6', 'CC15', 'CC19'].includes(cc));
+const MAPA_SQL_CALL_ACTIVO = `mapa(nombre, cc) AS (VALUES ${ASESORES_CC_CALL_ACTIVO.map(([n, c]) => `('${n.replace(/'/g, "''")}','${c}')`).join(',')})`;
 // LATERAL que devuelve la última gestión de derivación (≤31 días) del DNI de la venta
 // (tabla `ventas` = afectaciones PB, alias v). Se cruza contra gestion_call.
 const DERIV_LATERAL = `
@@ -1576,7 +1585,7 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
     await ensureAtribRealzza();
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
     const rows = await cached(`realzza/modulo|${anio}`, req.query.fresh, async () => (await pgPool.query(`
-      WITH ${MAPA_SQL}
+      WITH ${MAPA_SQL_CALL_ACTIVO}
       SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
              v.doc_identidad, v.productos, v.cuotas, v.estado_venta, v.entidad, v.vendedor,
              COALESCE(r.asesor_venta, v.asesor_venta) AS asesor_venta,
@@ -1635,7 +1644,7 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
     const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
 
     const rows = await cached(`ventas-realzza-motos-fuente|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh, async () => (await pgPool.query(`
-      WITH ${MAPA_SQL},
+      WITH ${MAPA_SQL_CALL_ACTIVO},
       base AS (
         SELECT v.codigo_cv, v.estado_venta, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
           COALESCE(NULLIF(r.tipo_base,''),
