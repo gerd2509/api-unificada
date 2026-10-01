@@ -76,6 +76,12 @@ async function ensurePerfIndexes() {
     [`ix_gr_dni_norm`, `gestion_realzza`, `((regexp_replace(dni_cliente,'\\D','','g')))`],
     [`ix_gc_dni_norm`, `gestion_call`,    `((regexp_replace(dni_cliente,'\\D','','g')))`],
     [`ix_ventas_docid_norm`, `ventas`,     `((regexp_replace(doc_identidad,'\\D','','g')))`],
+    // marca_temporal::date — mismo caso que ix_gestion_marca_dia/ix_ccs_marca_dia (gestion.js):
+    // sin este índice de expresión, un filtro `marca_temporal::date >= $1 AND <= $2` (usado
+    // por /gestion-call, /gestion-realzza con rango de fechas) hace Seq Scan completo de la
+    // tabla en vez de Index Scan. Con más sedes (Piura/Lima) y más usuarios esto se agrava.
+    [`ix_gc_marca_dia`,  `gestion_call`,    `((marca_temporal::date))`],
+    [`ix_grz_marca_dia`, `gestion_realzza`, `((marca_temporal::date))`],
   ];
   for (const [name, tabla, expr] of idx) {
     try { await pgPool.query(`CREATE INDEX IF NOT EXISTS ${name} ON ${tabla} ${expr}`); }
