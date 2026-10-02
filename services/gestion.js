@@ -881,12 +881,22 @@ app.get('/gestion-kommo', async (req, res) => {
     await ensureGestionKommoSchema();
     let desde = req.query.desde ? String(req.query.desde) : '';
     let hasta = req.query.hasta ? String(req.query.hasta) : '';
-    if (!desde && !hasta && !req.query.canal && !req.query.asesor && !(req.query.leadMes && req.query.leadAnio)) {
+    if (!desde && !hasta && !req.query.canal && !req.query.asesor && !req.query.sede && !(req.query.leadMes && req.query.leadAnio)) {
       const d = new Date(); d.setDate(d.getDate() - 90);
       desde = d.toISOString().slice(0, 10);
     }
     const cond = []; const params = [];
     if (req.query.canal)  { params.push(String(req.query.canal).toUpperCase()); cond.push(`UPPER(canal) = $${params.length}`); }
+    // Sede dentro del canal Realzza: 'REALZZA PIURA'/'REALZZA LIMA' exactas, o 'REALZZA'
+    // (Chiclayo/histórico) con ?sede=REALZZA que EXCLUYE las otras tiendas explícitas.
+    if (req.query.sede) {
+      const sedeQ = String(req.query.sede).trim().toUpperCase();
+      if (sedeQ === 'REALZZA') {
+        cond.push(`(sede IS NULL OR UPPER(sede) NOT IN ('REALZZA PIURA','REALZZA LIMA'))`);
+      } else {
+        params.push(sedeQ); cond.push(`UPPER(sede) = $${params.length}`);
+      }
+    }
     if (desde)  { params.push(`${desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
     if (hasta)  { params.push(`${hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
     if (req.query.asesor) { params.push(String(req.query.asesor).trim()); cond.push(`asesor ILIKE $${params.length}`); }

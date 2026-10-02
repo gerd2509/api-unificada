@@ -1654,6 +1654,18 @@ app.get('/gestion-realzza', async (req, res) => {
       desde = d.toISOString().slice(0, 10);
     }
     const cond = []; const params = [];
+    // Tienda Realzza: 'REALZZA PIURA'/'REALZZA LIMA' exactas; ?sede=REALZZA = Chiclayo/
+    // histórico (todo lo que NO sea una de las otras tiendas explícitas).
+    if (req.query.sede) {
+      const sedeQ = String(req.query.sede).trim().toUpperCase();
+      if (sedeQ === 'REALZZA') {
+        params.push('REALZZA PIURA'); const p1 = params.length;
+        params.push('REALZZA LIMA');  const p2 = params.length;
+        cond.push(`(sede IS NULL OR UPPER(sede) NOT IN ($${p1}, $${p2}))`);
+      } else {
+        params.push(sedeQ); cond.push(`UPPER(sede) = $${params.length}`);
+      }
+    }
     if (desde) { params.push(`${desde} 00:00:00`); cond.push(`marca_temporal >= $${params.length}`); }
     if (hasta) { params.push(`${hasta} 23:59:59`); cond.push(`marca_temporal <= $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
