@@ -1631,6 +1631,21 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
   } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// Tienda Realzza por etiqueta de sede de la venta: 'SEDE RETAIL REALZZA PIURA' / 'LIMA';
+// cualquier otra Realzza ('SEDE REALZZA STORE') = Chiclayo. ?tienda= acepta REALZZA,
+// REALZZA PIURA, REALZZA LIMA (cualquier otro valor = todas).
+function tiendaRzParam(q) {
+  const t = String(q || '').trim().toUpperCase();
+  return ['REALZZA', 'REALZZA PIURA', 'REALZZA LIMA'].includes(t) ? t : '';
+}
+function sedeTiendaSQL(col, tienda) {
+  const s = `UPPER(${col})`;
+  if (tienda === 'REALZZA PIURA') return `AND ${s} LIKE '%PIURA%'`;
+  if (tienda === 'REALZZA LIMA') return `AND ${s} LIKE '%LIMA%'`;
+  if (tienda === 'REALZZA') return `AND ${s} NOT LIKE '%PIURA%' AND ${s} NOT LIKE '%LIMA%'`;
+  return '';
+}
+
 // GET /ventas-realzza/motos-fuente?anioDesde=&mesDesde=&anioHasta=&mesHasta=
 //   Solo MOTOS (estado_tipo_producto LIKE '%MOTO%') de Realzza, operaciones NETAS
 //   (− NC/incautaciones arrastradas) por mes, agrupadas en 2 fuentes:
@@ -1649,7 +1664,8 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
     const anioHasta = parseInt(req.query.anioHasta, 10) || hoy.getFullYear();
     const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
 
-    const rows = await cached(`ventas-realzza-motos-fuente|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh, async () => (await pgPool.query(`
+    const tienda = tiendaRzParam(req.query.tienda);
+    const rows = await cached(`ventas-realzza-motos-fuente|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}|${tienda}`, req.query.fresh, async () => (await pgPool.query(`
       WITH ${MAPA_SQL_CALL_ACTIVO},
       base AS (
         SELECT v.codigo_cv, v.estado_venta, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af,
@@ -1676,6 +1692,7 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
         ) grz ON true
         LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
         WHERE v.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(v.estado_tipo_producto,'')) LIKE '%MOTO%'
+          ${sedeTiendaSQL('v.sede', tienda)}
       ),
       cat AS (
         SELECT *,
@@ -1723,6 +1740,7 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribRealzza();
+    const tienda = tiendaRzParam(req.query.tienda);
     const { rows } = await pgPool.query(`
       WITH meses AS (
         SELECT DISTINCT anio_cv AS anio, mes_cv AS mes FROM ventas_realzza
@@ -1735,6 +1753,7 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
         WHERE sede ILIKE '%REALZZA%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%'
           AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
           AND monto_consolidado > 0
+          ${sedeTiendaSQL('sede', tienda)}
         GROUP BY anio_cv, mes_cv
       ),
       ncnr AS (
@@ -1742,7 +1761,7 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
         -- CV ≠ AF): NOTA DE CRÉDITO e INCAUTACIÓN. Las del MISMO mes (CV=AF) netean a 0
         -- (ya excluidas de ven/meses) → no restan de nuevo.
         SELECT n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
-        WHERE n.sede ILIKE '%REALZZA%'
+        WHERE n.sede ILIKE '%REALZZA%' ${sedeTiendaSQL('n.sede', tienda)}
           AND (UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(n.estado_venta,'')) LIKE '%INCAUTAC%')
           AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
           AND NOT (n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af)
