@@ -305,14 +305,17 @@ app.post('/auth/cambiar-password', async (req, res) => {
   } catch (e) { console.error('❌ /auth/cambiar-password:', e); res.status(500).json({ success: false, message: 'No se pudo cambiar la contraseña.' }); }
 });
 
-// GET /auth/marca?usuario=... — sede del usuario (sin contraseña) para personalizar el branding del login.
+// GET /auth/marca?usuario=... — sede/rol/módulos del usuario (sin contraseña), para
+// personalizar el branding del login (incluye rol+modulos para detectar al jefe Realzza
+// general, sede 'todas', que no se reconoce solo por la sede).
 app.get('/auth/marca', async (req, res) => {
   const usuario = (req.query.usuario || '').toString().trim();
   if (!pgPool || !usuario) return res.json({});
   try {
     await ensureUsuariosSchema();
-    const { rows } = await pgPool.query('SELECT sede FROM usuarios WHERE lower(usuario) = lower($1) LIMIT 1', [usuario]);
-    res.json({ sede: rows[0] ? (rows[0].sede || '') : '' });
+    const { rows } = await pgPool.query('SELECT sede, rol, modulos FROM usuarios WHERE lower(usuario) = lower($1) LIMIT 1', [usuario]);
+    const r = rows[0];
+    res.json(r ? { sede: r.sede || '', rol: r.rol || '', modulos: r.modulos || [] } : {});
   } catch (e) { console.error('❌ /auth/marca:', e.message); res.json({}); }
 });
 
