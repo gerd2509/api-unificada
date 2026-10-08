@@ -1091,6 +1091,28 @@ app.get('/ventas-realzza/buscar', async (req, res) => {
   } catch (e) { console.error('❌ GET /ventas-realzza/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /ventas-realzza/por-cc?cc=CC5 — TODAS las ventas Realzza (cualquier tienda, sin
+// acotar mes) atribuidas (asesor_venta) a ese código de Call. Para que Mi Panel de la
+// asesora de Call sume también sus derivaciones a Realzza (Chiclayo/Piura/Lima) en su
+// sueldo, igual que las ve la Atribución Call→Realzza.
+app.get('/ventas-realzza/por-cc', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    const cc = String(req.query.cc || '').trim();
+    if (!cc) return res.json([]);
+    const cond = ["v.sede ILIKE '%REALZZA%'", 'v.monto_consolidado > 0',
+      "COALESCE(vr.asesor_venta, v.asesor_venta) ILIKE $2"];
+    const params = [DERIV_MOTIVOS_RZ, cc];
+    const { rows } = await pgPool.query(`
+      SELECT ${ATRIB_SELECT_RZ}
+      ${ATRIB_FROM_RZ}
+      WHERE ${cond.join(' AND ')}
+      ORDER BY v.fecha_cv DESC NULLS LAST`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-realzza/por-cc:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // PUT /ventas-realzza/:codigo — edita a mano TipoBase / AsesorVenta (protege del re-cruce).
 app.put('/ventas-realzza/:codigo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
