@@ -1055,14 +1055,16 @@ app.get('/ventas-realzza/atribucion', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribRealzza();
-    // TODAS las ventas SEDE REALZZA STORE del mes con monto > 0 (derivadas o no).
+    const tienda = tiendaRzParam(req.query.tienda);
+    // TODAS las ventas Realzza del mes con monto > 0 (derivadas o no), de la tienda elegida
+    // (Chiclayo por defecto si no se manda ?tienda=).
     const cond = ["v.sede ILIKE '%REALZZA%'", 'v.monto_consolidado > 0']; const params = [DERIV_MOTIVOS_RZ];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const { rows } = await pgPool.query(`
       SELECT ${ATRIB_SELECT_RZ}
       ${ATRIB_FROM_RZ}
-      WHERE ${cond.join(' AND ')}
+      WHERE ${cond.join(' AND ')} ${sedeTiendaSQL('v.sede', tienda)}
       ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`, params);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas-realzza/atribucion:', e); res.status(500).json({ success: false, message: e.message }); }
@@ -1075,6 +1077,7 @@ app.get('/ventas-realzza/buscar', async (req, res) => {
     await ensureAtribRealzza();
     const dni = String(req.query.dni || '').replace(/\D/g, '');
     if (!dni) return res.json([]);
+    const tienda = tiendaRzParam(req.query.tienda);
     const cond = [`regexp_replace(v.doc_identidad, '\\D', '', 'g') = $2`, "v.sede ILIKE '%REALZZA%'"];
     const params = [DERIV_MOTIVOS_RZ, dni];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
@@ -1082,7 +1085,7 @@ app.get('/ventas-realzza/buscar', async (req, res) => {
     const { rows } = await pgPool.query(`
       SELECT ${ATRIB_SELECT_RZ}
       ${ATRIB_FROM_RZ}
-      WHERE ${cond.join(' AND ')}
+      WHERE ${cond.join(' AND ')} ${sedeTiendaSQL('v.sede', tienda)}
       ORDER BY v.fecha_cv DESC NULLS LAST`, params);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas-realzza/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
@@ -1130,6 +1133,7 @@ app.post('/ventas-realzza/consolidar', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribRealzza();
+    const tienda = tiendaRzParam(req.query.tienda);
     // $1 = motivos de derivación (para el LATERAL que aporta el TipoBase al insertar).
     const cond = ["v.sede ILIKE '%REALZZA%'"]; const params = [DERIV_MOTIVOS_RZ];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
@@ -1145,7 +1149,7 @@ app.post('/ventas-realzza/consolidar', async (req, res) => {
              v.tipo_credito, v.estado_tipo_producto, v.dia_af, v.mes_af, v.anio_af, g.tipo_base,
              (g.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8)))
       FROM ventas v ${DERIV_LATERAL_RZ}
-      WHERE ${cond.join(' AND ')}
+      WHERE ${cond.join(' AND ')} ${sedeTiendaSQL('v.sede', tienda)}
       ON CONFLICT (codigo_cv) DO NOTHING
       RETURNING codigo_cv`, params);
     res.json({ success: true, insertados: rows.length });
