@@ -2314,22 +2314,23 @@ app.get('/reporte-global', async (req, res) => {
     await ensureVentasSchema();
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
     const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;   // 0 = todo el año
-    const rows = await cached(`reporte-global|${anio}|${mes}`, req.query.fresh, async () => (await pgPool.query(`
+    const dia = req.query.dia ? parseInt(req.query.dia, 10) : 0;   // 0 = sin tope de día (mes/año completo)
+    const rows = await cached(`reporte-global|${anio}|${mes}|${dia}`, req.query.fresh, async () => (await pgPool.query(`
       WITH ent AS (
         SELECT sede,
           NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') AS entidad,
           (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto,
-          estado_venta, monto_consolidado, anio_cv, mes_cv, anio_af, mes_af
+          estado_venta, monto_consolidado, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af
         FROM ventas
       ),
       ven AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
         WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-          AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) GROUP BY sede, entidad, es_moto),
+          AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3) GROUP BY sede, entidad, es_moto),
       nc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
-        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
           AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af) GROUP BY sede, entidad, es_moto),
       inc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
-        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
           AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af) GROUP BY sede, entidad, es_moto),
       claves AS (SELECT sede, entidad, es_moto FROM ven UNION SELECT sede, entidad, es_moto FROM nc UNION SELECT sede, entidad, es_moto FROM inc)
       SELECT k.sede, k.entidad, k.es_moto,
@@ -2340,7 +2341,7 @@ app.get('/reporte-global', async (req, res) => {
       LEFT JOIN nc  ON nc.sede=k.sede  AND nc.entidad IS NOT DISTINCT FROM k.entidad  AND nc.es_moto=k.es_moto
       LEFT JOIN inc ON inc.sede=k.sede AND inc.entidad IS NOT DISTINCT FROM k.entidad AND inc.es_moto=k.es_moto
       WHERE COALESCE(k.sede,'') <> ''
-      ORDER BY k.sede, k.entidad`, [anio, mes])).rows);
+      ORDER BY k.sede, k.entidad`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -2361,7 +2362,8 @@ app.get('/reporte-global-motos', async (req, res) => {
     await ensureVentasSchema();
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
     const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;
-    const rows = await cached(`reporte-global-motos|${anio}|${mes}`, req.query.fresh, async () => (await pgPool.query(`
+    const dia = req.query.dia ? parseInt(req.query.dia, 10) : 0;   // 0 = sin tope de día
+    const rows = await cached(`reporte-global-motos|${anio}|${mes}|${dia}`, req.query.fresh, async () => (await pgPool.query(`
       WITH ent AS (
         SELECT
           CASE WHEN UPPER(COALESCE(entidad,'')) = 'GLOBAL GO' THEN 'GLOBAL' ELSE 'PROPIO' END AS credito,
@@ -2374,16 +2376,16 @@ app.get('/reporte-global-motos', async (req, res) => {
                  OR UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO%' THEN 'MOTOTAXI'
                ELSE 'OTRO' END AS tipo,
           COALESCE(NULLIF(TRIM(vendedor),''), '(sin vendedor)') AS vendedor,
-          sede, estado_venta, anio_cv, mes_cv, anio_af, mes_af
+          sede, estado_venta, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af
         FROM ventas
         WHERE UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'
       ),
       ven AS (SELECT sede, credito, marca, tipo, vendedor, COUNT(*)::int AS motos FROM ent
         WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-          AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) GROUP BY sede, credito, marca, tipo, vendedor),
+          AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3) GROUP BY sede, credito, marca, tipo, vendedor),
       canc AS (SELECT sede, credito, marca, tipo, vendedor, COUNT(*)::int AS motos FROM ent
         WHERE (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
-          AND anio_af = $1 AND ($2 = 0 OR mes_af = $2)
+          AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
           AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af) GROUP BY sede, credito, marca, tipo, vendedor),
       claves AS (SELECT sede, credito, marca, tipo, vendedor FROM ven UNION SELECT sede, credito, marca, tipo, vendedor FROM canc)
       SELECT * FROM (
@@ -2394,7 +2396,7 @@ app.get('/reporte-global-motos', async (req, res) => {
         LEFT JOIN canc ON canc.sede=k.sede AND canc.credito=k.credito AND canc.marca=k.marca AND canc.tipo=k.tipo AND canc.vendedor=k.vendedor
       ) t
       WHERE motos > 0
-      ORDER BY sede, motos DESC`, [anio, mes])).rows);
+      ORDER BY sede, motos DESC`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -2409,8 +2411,9 @@ app.get('/margen-linea-sede', async (req, res) => {
     const cond = [], params = [];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`EXTRACT(YEAR FROM fecha) = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`EXTRACT(MONTH FROM fecha) = $${params.length}`); }
+    if (req.query.dia)  { params.push(parseInt(req.query.dia, 10));  cond.push(`EXTRACT(DAY FROM fecha) <= $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
-    const rows = await cached(`margen-linea-sede|${req.query.anio || ''}|${req.query.mes || ''}`, req.query.fresh, async () =>
+    const rows = await cached(`margen-linea-sede|${req.query.anio || ''}|${req.query.mes || ''}|${req.query.dia || ''}`, req.query.fresh, async () =>
       (await pgPool.query(
         `SELECT COALESCE(NULLIF(TRIM(sede),''),'SIN SEDE') AS sede,
                 COALESCE(NULLIF(UPPER(TRIM(linea_real)),''),'SIN LÍNEA') AS linea_real,
