@@ -137,6 +137,9 @@ async function ensureGestionSchema() {
   await pgPool.query(`ALTER TABLE gestion ADD COLUMN IF NOT EXISTS marca_temporal TIMESTAMP`);
   await pgPool.query(`ALTER TABLE gestion ADD COLUMN IF NOT EXISTS origen TEXT NOT NULL DEFAULT 'app'`);
   await pgPool.query(`ALTER TABLE gestion ADD COLUMN IF NOT EXISTS hash_row TEXT`);
+  // Comentario cuando el motivo de contacto es "No desea -sin razón" (columna nueva
+  // del formulario/hoja: 'DETALLE(COMENTARIO) NO DESEA SIN RAZON').
+  await pgPool.query(`ALTER TABLE gestion ADD COLUMN IF NOT EXISTS detalle_no_desea TEXT`);
   await pgPool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_gestion_hash ON gestion (hash_row) WHERE hash_row IS NOT NULL`);
   await pgPool.query(`CREATE INDEX IF NOT EXISTS ix_gestion_marca ON gestion (marca_temporal)`);
   await pgPool.query(`CREATE INDEX IF NOT EXISTS ix_gestion_sede ON gestion (sede)`);
@@ -168,12 +171,12 @@ app.post('/gestion', async (req, res) => {
     const q = `INSERT INTO gestion
       (registrado_por, dni_cliente, sede, asesor, tipo_gestion, resultado,
        motivo_contacto, motivo_no_contacto, fecha_compromiso, valor_venta,
-       producto_interes, detalle_contacto, celular_actualizado, marca_temporal)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, (now() AT TIME ZONE 'America/Lima')) RETURNING *`;
+       producto_interes, detalle_contacto, celular_actualizado, detalle_no_desea, marca_temporal)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, (now() AT TIME ZONE 'America/Lima')) RETURNING *`;
     const vals = [
       norm(b.registrado_por), b.dni_cliente, b.sede, b.asesor, b.tipo_gestion, b.resultado,
       norm(b.motivo_contacto), norm(b.motivo_no_contacto), norm(b.fecha_compromiso), valorVenta,
-      norm(b.producto_interes), norm(b.detalle_contacto), norm(b.celular_actualizado),
+      norm(b.producto_interes), norm(b.detalle_contacto), norm(b.celular_actualizado), norm(b.detalle_no_desea),
     ];
     const { rows } = await pgPool.query(q, vals);
     res.json({ success: true, gestion: rows[0] });
@@ -233,6 +236,7 @@ function mapGestionSedeSheet(row) {
     producto_interes: txt(row['PRODUCTO DE INTERES']) || null,
     detalle_contacto: txt(row['DETALLE(COMENTARIO) CONTACTO']) || null,
     celular_actualizado: celular || null,
+    detalle_no_desea: txt(row['DETALLE(COMENTARIO) NO DESEA SIN RAZON']) || null,
     hash_row: crypto.createHash('sha1').update([raw, dni, asesor, resultado, celular].join('|')).digest('hex'),
   };
 }
@@ -270,7 +274,7 @@ app.post('/gestion/sync-sedes', async (req, res) => {
       .filter(f => f.dni_cliente && f.sede && f.asesor && f.tipo_gestion && f.resultado);
     const COLS = ['marca_temporal', 'dni_cliente', 'sede', 'asesor', 'tipo_gestion', 'resultado',
       'motivo_contacto', 'motivo_no_contacto', 'fecha_compromiso', 'valor_venta', 'producto_interes',
-      'detalle_contacto', 'celular_actualizado', 'hash_row', 'origen'];
+      'detalle_contacto', 'celular_actualizado', 'detalle_no_desea', 'hash_row', 'origen'];
     let insertados = 0;
     const client = await pgPool.connect();
     try {
@@ -282,7 +286,7 @@ app.post('/gestion/sync-sedes', async (req, res) => {
           const base = idx * COLS.length;
           params.push(f.marca_temporal, f.dni_cliente, f.sede, f.asesor, f.tipo_gestion, f.resultado,
             f.motivo_contacto, f.motivo_no_contacto, f.fecha_compromiso, f.valor_venta, f.producto_interes,
-            f.detalle_contacto, f.celular_actualizado, f.hash_row, 'sheet');
+            f.detalle_contacto, f.celular_actualizado, f.detalle_no_desea, f.hash_row, 'sheet');
           return '(' + COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
         });
         const r = await client.query(
@@ -329,7 +333,7 @@ app.get('/gestion', async (req, res) => {
       `SELECT id, ${FECHA} AS fecha, to_char(${FECHA}, 'DD/MM/YYYY HH24:MI:SS') AS marca,
               dni_cliente, sede, asesor, tipo_gestion, resultado,
               motivo_contacto, motivo_no_contacto, fecha_compromiso, valor_venta, producto_interes,
-              detalle_contacto, celular_actualizado, origen
+              detalle_contacto, celular_actualizado, detalle_no_desea, origen
        FROM gestion ${where} ORDER BY ${FECHA} DESC`, params);
     res.json(rows);
   } catch (e) { console.error('❌ GET /gestion:', e); res.status(500).json({ success: false, message: e.message }); }
@@ -377,7 +381,7 @@ app.put('/gestion/:id', async (req, res) => {
     const b = req.body || {};
     const sets = [], vals = [];
     const editable = ['dni_cliente', 'sede', 'asesor', 'tipo_gestion', 'resultado', 'motivo_contacto',
-      'motivo_no_contacto', 'producto_interes', 'detalle_contacto', 'celular_actualizado'];
+      'motivo_no_contacto', 'producto_interes', 'detalle_contacto', 'celular_actualizado', 'detalle_no_desea'];
     for (const c of editable) if (b[c] !== undefined) { vals.push(String(b[c] ?? '').trim() || null); sets.push(`${c} = $${vals.length}`); }
     if (b.fecha_compromiso !== undefined) { vals.push(b.fecha_compromiso || null); sets.push(`fecha_compromiso = $${vals.length}`); }
     if (b.valor_venta !== undefined) { const n = Number(String(b.valor_venta).replace(/[^0-9.]/g, '')); vals.push(n || null); sets.push(`valor_venta = $${vals.length}`); }
