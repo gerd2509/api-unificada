@@ -2307,6 +2307,10 @@ app.get('/avance-vendedor', async (req, res) => {
 //   ops  = igual, pero en UNIDADES (antes solo se netaba el monto; el conteo de "ops"
 //   quedaba bruto sin descontar las canceladas/incautadas, por eso no cuadraba con
 //   /reporte-global-motos, que sí resta unidades — mismo dato, dos criterios distintos).
+//   monto_bruto/ops_bruto = SOLO ventas del periodo (sin restar NC/incautaciones arrastradas
+//   de otros meses) — el front los usa para motos, para cuadrar con "Ventas Campo" (que
+//   cuenta motos por fecha de venta, no neto); el resto (Aliados, Neto Global) sigue usando
+//   neto/ops.
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/reporte-global', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -2335,7 +2339,9 @@ app.get('/reporte-global', async (req, res) => {
       claves AS (SELECT sede, entidad, es_moto FROM ven UNION SELECT sede, entidad, es_moto FROM nc UNION SELECT sede, entidad, es_moto FROM inc)
       SELECT k.sede, k.entidad, k.es_moto,
         ROUND(COALESCE(ven.monto,0) - COALESCE(nc.monto,0) - COALESCE(inc.monto,0))::int AS neto,
-        GREATEST(COALESCE(ven.ops,0) - COALESCE(nc.ops,0) - COALESCE(inc.ops,0), 0)::int AS ops
+        GREATEST(COALESCE(ven.ops,0) - COALESCE(nc.ops,0) - COALESCE(inc.ops,0), 0)::int AS ops,
+        ROUND(COALESCE(ven.monto,0))::int AS monto_bruto,
+        COALESCE(ven.ops,0)::int AS ops_bruto
       FROM claves k
       LEFT JOIN ven ON ven.sede=k.sede AND ven.entidad IS NOT DISTINCT FROM k.entidad AND ven.es_moto=k.es_moto
       LEFT JOIN nc  ON nc.sede=k.sede  AND nc.entidad IS NOT DISTINCT FROM k.entidad  AND nc.es_moto=k.es_moto
@@ -2347,7 +2353,9 @@ app.get('/reporte-global', async (req, res) => {
 });
 
 // GET /reporte-global-motos?anio=&mes= → motos a nivel detalle por (sede, credito, marca,
-//   tipo, vendedor) con el # NETO de motos (vendidas − NC/incautaciones arrastradas).
+//   tipo, vendedor) con el # NETO de motos (vendidas − NC/incautaciones arrastradas) y
+//   motos_bruto (solo ventas del periodo, sin restar NC/incautaciones arrastradas de otros
+//   meses — el front lo usa para cuadrar con "Ventas Campo").
 //   · credito: GLOBAL (entidad GLOBAL GO) / PROPIO (resto, principalmente LEONCITO).
 //   · marca:   WANXIN / SSENDA / OTRAS (según el texto del producto).
 //   · tipo:    MOTO CARGUERA (si el producto dice 'TRIMOTO DE CARGA'), MOTO LINEAL, MOTOTAXI.
@@ -2390,13 +2398,14 @@ app.get('/reporte-global-motos', async (req, res) => {
       claves AS (SELECT sede, credito, marca, tipo, vendedor FROM ven UNION SELECT sede, credito, marca, tipo, vendedor FROM canc)
       SELECT * FROM (
         SELECT k.sede, k.credito, k.marca, k.tipo, k.vendedor,
-          (COALESCE(ven.motos,0) - COALESCE(canc.motos,0))::int AS motos
+          (COALESCE(ven.motos,0) - COALESCE(canc.motos,0))::int AS motos,
+          COALESCE(ven.motos,0)::int AS motos_bruto
         FROM claves k
         LEFT JOIN ven  ON ven.sede=k.sede  AND ven.credito=k.credito  AND ven.marca=k.marca  AND ven.tipo=k.tipo  AND ven.vendedor=k.vendedor
         LEFT JOIN canc ON canc.sede=k.sede AND canc.credito=k.credito AND canc.marca=k.marca AND canc.tipo=k.tipo AND canc.vendedor=k.vendedor
       ) t
-      WHERE motos > 0
-      ORDER BY sede, motos DESC`, [anio, mes, dia])).rows);
+      WHERE motos > 0 OR motos_bruto > 0
+      ORDER BY sede, motos_bruto DESC`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: e.message }); }
 });
