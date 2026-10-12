@@ -140,6 +140,10 @@ async function ensureGestionSchema() {
   // Comentario cuando el motivo de contacto es "No desea -sin razón" (columna nueva
   // del formulario/hoja: 'DETALLE(COMENTARIO) NO DESEA SIN RAZON').
   await pgPool.query(`ALTER TABLE gestion ADD COLUMN IF NOT EXISTS detalle_no_desea TEXT`);
+  // Celular Gestionado: número al que REALMENTE se llamó, obligatorio en TODA gestión
+  // (a diferencia de celular_actualizado, que solo aplica en la rama "detalle"). Permite
+  // saber con certeza qué número se gestionó en cada registro (Avance de Cartera → Intensidad).
+  await pgPool.query(`ALTER TABLE gestion ADD COLUMN IF NOT EXISTS celular_gestionado TEXT`);
   await pgPool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_gestion_hash ON gestion (hash_row) WHERE hash_row IS NOT NULL`);
   await pgPool.query(`CREATE INDEX IF NOT EXISTS ix_gestion_marca ON gestion (marca_temporal)`);
   await pgPool.query(`CREATE INDEX IF NOT EXISTS ix_gestion_sede ON gestion (sede)`);
@@ -154,7 +158,7 @@ app.post('/gestion', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Base de datos no configurada (falta DATABASE_URL).' });
   }
   const b = req.body || {};
-  const requeridos = ['dni_cliente', 'sede', 'asesor', 'tipo_gestion', 'resultado'];
+  const requeridos = ['dni_cliente', 'celular_gestionado', 'sede', 'asesor', 'tipo_gestion', 'resultado'];
   for (const campo of requeridos) {
     if (!b[campo] || b[campo].toString().trim() === '') {
       return res.status(400).json({ success: false, message: `Falta el campo obligatorio: ${campo}.` });
@@ -169,12 +173,12 @@ app.post('/gestion', async (req, res) => {
   try {
     await ensureGestionSchema();
     const q = `INSERT INTO gestion
-      (registrado_por, dni_cliente, sede, asesor, tipo_gestion, resultado,
+      (registrado_por, dni_cliente, celular_gestionado, sede, asesor, tipo_gestion, resultado,
        motivo_contacto, motivo_no_contacto, fecha_compromiso, valor_venta,
        producto_interes, detalle_contacto, celular_actualizado, detalle_no_desea, marca_temporal)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, (now() AT TIME ZONE 'America/Lima')) RETURNING *`;
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, (now() AT TIME ZONE 'America/Lima')) RETURNING *`;
     const vals = [
-      norm(b.registrado_por), b.dni_cliente, b.sede, b.asesor, b.tipo_gestion, b.resultado,
+      norm(b.registrado_por), b.dni_cliente, b.celular_gestionado, b.sede, b.asesor, b.tipo_gestion, b.resultado,
       norm(b.motivo_contacto), norm(b.motivo_no_contacto), norm(b.fecha_compromiso), valorVenta,
       norm(b.producto_interes), norm(b.detalle_contacto), norm(b.celular_actualizado), norm(b.detalle_no_desea),
     ];
@@ -222,11 +226,12 @@ function mapGestionSedeSheet(row) {
   const dni = txt(row['DNI CLIENTE']);
   const resultado = txt(row['RESULTADO DE GESTION']);
   const celular = txt(row['N° CELULAR ACTUALIZADO']);
+  const celularGestionado = txt(row['CELULAR GESTIONADO']);
   const raw = txt(row['Marca temporal']);
   const valorNum = Number(txt(row['VALOR DE LA VENTA']).replace(/[^0-9.]/g, ''));
   return {
     marca_temporal: parseMarcaSheet(raw),
-    dni_cliente: dni, sede, asesor,
+    dni_cliente: dni, celular_gestionado: celularGestionado || null, sede, asesor,
     tipo_gestion: txt(row['TIPO DE GESTION']),
     resultado,
     motivo_contacto: txt(row['MOTIVOS "CONTACTO EN LA GESTION"']) || null,
@@ -272,7 +277,7 @@ app.post('/gestion/sync-sedes', async (req, res) => {
     const filas = (Array.isArray(data) ? data : [])
       .map(mapGestionSedeSheet)
       .filter(f => f.dni_cliente && f.sede && f.asesor && f.tipo_gestion && f.resultado);
-    const COLS = ['marca_temporal', 'dni_cliente', 'sede', 'asesor', 'tipo_gestion', 'resultado',
+    const COLS = ['marca_temporal', 'dni_cliente', 'celular_gestionado', 'sede', 'asesor', 'tipo_gestion', 'resultado',
       'motivo_contacto', 'motivo_no_contacto', 'fecha_compromiso', 'valor_venta', 'producto_interes',
       'detalle_contacto', 'celular_actualizado', 'detalle_no_desea', 'hash_row', 'origen'];
     let insertados = 0;
@@ -284,7 +289,7 @@ app.post('/gestion/sync-sedes', async (req, res) => {
         const params = [];
         const tuples = chunk.map((f, idx) => {
           const base = idx * COLS.length;
-          params.push(f.marca_temporal, f.dni_cliente, f.sede, f.asesor, f.tipo_gestion, f.resultado,
+          params.push(f.marca_temporal, f.dni_cliente, f.celular_gestionado, f.sede, f.asesor, f.tipo_gestion, f.resultado,
             f.motivo_contacto, f.motivo_no_contacto, f.fecha_compromiso, f.valor_venta, f.producto_interes,
             f.detalle_contacto, f.celular_actualizado, f.detalle_no_desea, f.hash_row, 'sheet');
           return '(' + COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
@@ -331,7 +336,7 @@ app.get('/gestion', async (req, res) => {
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(
       `SELECT id, ${FECHA} AS fecha, to_char(${FECHA}, 'DD/MM/YYYY HH24:MI:SS') AS marca,
-              dni_cliente, sede, asesor, tipo_gestion, resultado,
+              dni_cliente, celular_gestionado, sede, asesor, tipo_gestion, resultado,
               motivo_contacto, motivo_no_contacto, fecha_compromiso, valor_venta, producto_interes,
               detalle_contacto, celular_actualizado, detalle_no_desea, origen
        FROM gestion ${where} ORDER BY ${FECHA} DESC`, params);
@@ -380,7 +385,7 @@ app.put('/gestion/:id', async (req, res) => {
     await ensureGestionSchema();
     const b = req.body || {};
     const sets = [], vals = [];
-    const editable = ['dni_cliente', 'sede', 'asesor', 'tipo_gestion', 'resultado', 'motivo_contacto',
+    const editable = ['dni_cliente', 'celular_gestionado', 'sede', 'asesor', 'tipo_gestion', 'resultado', 'motivo_contacto',
       'motivo_no_contacto', 'producto_interes', 'detalle_contacto', 'celular_actualizado', 'detalle_no_desea'];
     for (const c of editable) if (b[c] !== undefined) { vals.push(String(b[c] ?? '').trim() || null); sets.push(`${c} = $${vals.length}`); }
     if (b.fecha_compromiso !== undefined) { vals.push(b.fecha_compromiso || null); sets.push(`fecha_compromiso = $${vals.length}`); }
