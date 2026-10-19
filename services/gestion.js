@@ -654,7 +654,7 @@ app.post('/control-supervisor', async (req, res) => {
   const tipo = (b.tipo_control || 'GESTION').toString().toUpperCase();
   if (tipo === 'MARKET_PLACE') {
     const sub = (b.mp_subtipo || 'MARKET PLACE').toString().toUpperCase();
-    if (sub === 'KOMMO PLATAFORMA') {
+    if (sub === 'KOMMO PLATAFORMA' || sub === 'MARKET PLACE GESTION') {
       if (!b.asesor || !b.estado_lead) {
         return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (asesor, estado del lead).' });
       }
