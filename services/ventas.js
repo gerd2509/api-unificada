@@ -1769,10 +1769,14 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
     const tienda = tiendaRzParam(req.query.tienda);
     const { rows } = await pgPool.query(`
       WITH meses AS (
+        -- Acotado a la MISMA tienda del filtro: sin esto, Piura/Lima (recién abiertas)
+        -- heredaban todo el historial de meses de Chiclayo (la más antigua) y el
+        -- gráfico arrancaba años antes de que esa tienda vendiera algo, todo en S/0.
         SELECT DISTINCT anio_cv AS anio, mes_cv AS mes FROM ventas_realzza
         WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
           AND monto_consolidado > 0
           AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL
+          ${sedeTiendaSQL('sede', tienda)}
       ),
       ven AS (
         SELECT anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
