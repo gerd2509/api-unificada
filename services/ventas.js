@@ -1989,7 +1989,7 @@ registrarLeads('realzza', 'leads-kommo-realzza');
 // ─────────────────────────────────────────────────────────────────────────────
 const MARGEN_COLS = [
   'codigo_cv', 'fecha', 'cliente', 'producto', 'marca', 'linea_producto',
-  'cantidad', 'sede', 'linea_real', 'valor_venta', 'margen_total',
+  'cantidad', 'sede', 'linea_real', 'valor_venta', 'margen_total', 'tipo_producto',
 ];
 
 let margenSchemaLista = false;
@@ -2012,6 +2012,7 @@ async function ensureMargenSchema() {
       updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
       created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE margen_ventas ADD COLUMN IF NOT EXISTS tipo_producto TEXT;
     CREATE INDEX IF NOT EXISTS ix_margen_codigo ON margen_ventas (codigo_cv);
     CREATE INDEX IF NOT EXISTS ix_margen_sede   ON margen_ventas (sede);
     CREATE INDEX IF NOT EXISTS ix_margen_fecha  ON margen_ventas (fecha);
@@ -2043,6 +2044,7 @@ function mapMargenRow(r) {
     toStr(pickCol(r, 'LINEA REAL', 'LineaReal', 'linea_real')),
     toNum(pickCol(r, 'VALOR VENTA', 'ValorVenta', 'valor_venta')),
     toNum(pickCol(r, 'MARGEN TOTAL', 'MargenTotal', 'margen_total')),
+    toStr(pickCol(r, 'TipoProducto', 'Tipo Producto', 'TIPO PRODUCTO', 'tipo_producto')),
   ];
 }
 
