@@ -1989,7 +1989,7 @@ registrarLeads('realzza', 'leads-kommo-realzza');
 // ─────────────────────────────────────────────────────────────────────────────
 const MARGEN_COLS = [
   'codigo_cv', 'fecha', 'cliente', 'producto', 'marca', 'linea_producto',
-  'cantidad', 'sede', 'linea_real', 'valor_venta', 'margen_total', 'tipo_producto',
+  'cantidad', 'sede', 'linea_real', 'valor_venta', 'margen_total', 'tipo_producto', 'vendedor',
 ];
 
 let margenSchemaLista = false;
@@ -2013,6 +2013,7 @@ async function ensureMargenSchema() {
       created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     ALTER TABLE margen_ventas ADD COLUMN IF NOT EXISTS tipo_producto TEXT;
+    ALTER TABLE margen_ventas ADD COLUMN IF NOT EXISTS vendedor TEXT;
     CREATE INDEX IF NOT EXISTS ix_margen_codigo ON margen_ventas (codigo_cv);
     CREATE INDEX IF NOT EXISTS ix_margen_sede   ON margen_ventas (sede);
     CREATE INDEX IF NOT EXISTS ix_margen_fecha  ON margen_ventas (fecha);
@@ -2045,6 +2046,7 @@ function mapMargenRow(r) {
     toNum(pickCol(r, 'VALOR VENTA', 'ValorVenta', 'valor_venta')),
     toNum(pickCol(r, 'MARGEN TOTAL', 'MargenTotal', 'margen_total')),
     toStr(pickCol(r, 'TipoProducto', 'Tipo Producto', 'TIPO PRODUCTO', 'tipo_producto')),
+    toStr(pickCol(r, 'Vendedor', 'VENDEDOR', 'vendedor')),
   ];
 }
 
@@ -2461,7 +2463,7 @@ app.get('/margen-producto', async (req, res) => {
         `SELECT COALESCE(NULLIF(TRIM(m.tipo_producto),''),'SIN TIPO') AS tipo_producto,
                 COALESCE(NULLIF(UPPER(TRIM(m.marca)),''),'SIN MARCA') AS marca,
                 COALESCE(NULLIF(TRIM(m.sede),''),'SIN SEDE') AS sede,
-                COALESCE(NULLIF(UPPER(TRIM(COALESCE(v.vendedor, vc.vendedor, vr.vendedor))),''),'SIN VENDEDOR') AS vendedor,
+                COALESCE(NULLIF(UPPER(TRIM(COALESCE(m.vendedor, v.vendedor, vc.vendedor, vr.vendedor))),''),'SIN VENDEDOR') AS vendedor,
                 ROUND(SUM(COALESCE(m.cantidad,0)))::int AS cantidad,
                 ROUND(SUM(COALESCE(m.valor_venta,0)))::int AS monto,
                 ROUND(SUM(COALESCE(m.margen_total,0)))::int AS margen_total,
