@@ -2441,6 +2441,33 @@ app.get('/margen-linea-sede', async (req, res) => {
   } catch (e) { console.error('❌ GET /margen-linea-sede:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /margen-producto?anio=&mes= → ventas por (tipo_producto, marca, sede), desde
+// margen_ventas (1 fila por línea de producto, ya desglosado). Para el módulo
+// "Ventas × Tipo de Producto": cantidad y monto vendido por tipo/marca/sede, filtrado
+// por mes, para cruzar libremente en la grilla (agrupar por cualquiera de los 3).
+app.get('/margen-producto', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureMargenSchema();
+    const cond = [], params = [];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`EXTRACT(YEAR FROM fecha) = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`EXTRACT(MONTH FROM fecha) = $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const rows = await cached(`margen-producto|${req.query.anio || ''}|${req.query.mes || ''}`, req.query.fresh, async () =>
+      (await pgPool.query(
+        `SELECT COALESCE(NULLIF(TRIM(tipo_producto),''),'SIN TIPO') AS tipo_producto,
+                COALESCE(NULLIF(UPPER(TRIM(marca)),''),'SIN MARCA') AS marca,
+                COALESCE(NULLIF(TRIM(sede),''),'SIN SEDE') AS sede,
+                ROUND(SUM(COALESCE(cantidad,0)))::int AS cantidad,
+                ROUND(SUM(COALESCE(valor_venta,0)))::int AS monto,
+                ROUND(SUM(COALESCE(margen_total,0)))::int AS margen_total,
+                COUNT(*)::int AS ops
+         FROM margen_ventas ${where}
+         GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, params)).rows);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /margen-producto:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /ventas-linea-asesor?canal=CALL|REALZZA&anioDesde=&mesDesde=&anioHasta=&mesHasta=
 //   Monto por ASESOR × MES × categoría de línea (MOTOS / MELAMINA / RESTO), para el
