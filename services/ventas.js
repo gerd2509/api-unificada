@@ -1307,7 +1307,7 @@ app.put('/ventas-sedes/:codigo', async (req, res) => {
 // el canal del CAP es CAMPAÑA). Volumen/Reto = Fase 2 (requiere meta por sede).
 const IGV = 1.18;
 const COM_ELECTRO = 0.015, COM_MELAMINA = 0.03, COM_MOTOS = 0.01;
-const RMV_SEDE = 1130, BASICO_SEDE = 400;
+const RMV_SEDE = 1230, BASICO_SEDE = 400;
 // Categoría por venta CON IGV: [umbral, nombre, bono]
 const CAT_SEDE = [[150000, 'Leo Master', 600], [100000, 'Top Master', 450], [65000, 'Master', 300], [49000, 'Senior', 150]];
 // Bono Campañero por venta CON IGV (solo canal CAMPAÑA): [umbral, bono]
@@ -1439,7 +1439,7 @@ app.get('/ventas-sedes/sueldo', async (req, res) => {
     const tarifaMoto = motosGlobal >= 5 ? 125 : 100;
     const pagoMotosGlobal = motosGlobal * tarifaMoto;
 
-    // Sueldo base FIJO (RMV 1130) para todos + comisiones + bonos + adicional motos, todo aditivo.
+    // Sueldo base FIJO (RMV 1230) para todos + comisiones + bonos + adicional motos, todo aditivo.
     const sueldoBase = RMV_SEDE;
     const remTotal = sueldoBase + totalComisiones + bonoCategoria + bonoCampanero + bonoVolumen + pagoMotosGlobal;
 
