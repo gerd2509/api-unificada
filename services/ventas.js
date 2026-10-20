@@ -2449,21 +2449,29 @@ app.get('/margen-producto', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureMargenSchema();
+    await ensureVentasSchema();
+    await ensureCanalSchema('call');
+    await ensureCanalSchema('realzza');
     const cond = [], params = [];
-    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`EXTRACT(YEAR FROM fecha) = $${params.length}`); }
-    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`EXTRACT(MONTH FROM fecha) = $${params.length}`); }
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`EXTRACT(YEAR FROM m.fecha) = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`EXTRACT(MONTH FROM m.fecha) = $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const rows = await cached(`margen-producto|${req.query.anio || ''}|${req.query.mes || ''}`, req.query.fresh, async () =>
       (await pgPool.query(
-        `SELECT COALESCE(NULLIF(TRIM(tipo_producto),''),'SIN TIPO') AS tipo_producto,
-                COALESCE(NULLIF(UPPER(TRIM(marca)),''),'SIN MARCA') AS marca,
-                COALESCE(NULLIF(TRIM(sede),''),'SIN SEDE') AS sede,
-                ROUND(SUM(COALESCE(cantidad,0)))::int AS cantidad,
-                ROUND(SUM(COALESCE(valor_venta,0)))::int AS monto,
-                ROUND(SUM(COALESCE(margen_total,0)))::int AS margen_total,
+        `SELECT COALESCE(NULLIF(TRIM(m.tipo_producto),''),'SIN TIPO') AS tipo_producto,
+                COALESCE(NULLIF(UPPER(TRIM(m.marca)),''),'SIN MARCA') AS marca,
+                COALESCE(NULLIF(TRIM(m.sede),''),'SIN SEDE') AS sede,
+                COALESCE(NULLIF(UPPER(TRIM(COALESCE(v.vendedor, vc.vendedor, vr.vendedor))),''),'SIN VENDEDOR') AS vendedor,
+                ROUND(SUM(COALESCE(m.cantidad,0)))::int AS cantidad,
+                ROUND(SUM(COALESCE(m.valor_venta,0)))::int AS monto,
+                ROUND(SUM(COALESCE(m.margen_total,0)))::int AS margen_total,
                 COUNT(*)::int AS ops
-         FROM margen_ventas ${where}
-         GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, params)).rows);
+         FROM margen_ventas m
+         LEFT JOIN ventas v ON v.codigo_cv = m.codigo_cv
+         LEFT JOIN ventas_call vc ON vc.codigo_cv = m.codigo_cv
+         LEFT JOIN ventas_realzza vr ON vr.codigo_cv = m.codigo_cv
+         ${where}
+         GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`, params)).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /margen-producto:', e); res.status(500).json({ success: false, message: e.message }); }
 });
