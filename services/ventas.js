@@ -2541,6 +2541,9 @@ app.get('/ventas-linea-asesor', async (req, res) => {
     const anioHasta = parseInt(req.query.anioHasta, 10) || hoy.getFullYear();
     const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
     const esRealzza = canal === 'REALZZA';
+    // Tienda Realzza (Chiclayo/Piura/Lima) — opcional; sin ella trae las 3 juntas.
+    const tienda = esRealzza ? tiendaRzParam(req.query.tienda) : '';
+    const filtroTienda = tienda ? sedeTiendaSQL('v.sede', tienda) : '';
 
     // CASE de categoría (idéntico en ambas ramas): margen agregado por codigo_cv
     // (margen_ventas es por LÍNEA DE PRODUCTO, varias filas por venta — se agrega
@@ -2575,7 +2578,7 @@ app.get('/ventas-linea-asesor', async (req, res) => {
           mc.v_motos, mc.v_melamina, mc.v_total, v.estado_tipo_producto, v.productos
         FROM ventas v
         LEFT JOIN margen_cv mc ON mc.codigo_cv = v.codigo_cv
-        WHERE v.sede ILIKE '%REALZZA%'
+        WHERE v.sede ILIKE '%REALZZA%' ${filtroTienda}
       ),
       cat AS (SELECT *, ${CAT_CASE} AS categoria FROM base),
       ven AS (
@@ -2636,7 +2639,7 @@ app.get('/ventas-linea-asesor', async (req, res) => {
       GROUP BY 1, 2, 3, 4
       ORDER BY 1, 2, 3`;
 
-    const rows = await cached(`ventas-linea-asesor|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}`, req.query.fresh,
+    const rows = await cached(`ventas-linea-asesor|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}|${tienda}`, req.query.fresh,
       async () => (await pgPool.query(sql, [anioDesde, mesDesde, anioHasta, mesHasta])).rows);
 
     // Meses "proyección": el mes aún no está cubierto del todo por margen_ventas
