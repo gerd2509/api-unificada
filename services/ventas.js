@@ -1987,6 +1987,34 @@ function registrarLeads(canal, ruta) {
       res.status(500).json({ success: false, message: 'No se pudieron obtener los leads.' });
     }
   });
+  // GET /{ruta}/por-asesor?anioDesde=&mesDesde=&anioHasta=&mesHasta=&tienda= — leads
+  // a cargo de cada asesor (columna Embudo de ventas) en el rango, con cuántos siguen
+  // SIN RESPONDER (modificado_por vacío). Para el detalle de la Maduración de Leads.
+  app.get(`/${ruta}/por-asesor`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureLeadsSchema(canal);
+      const cond = ['anio_cr IS NOT NULL', 'mes_cr IS NOT NULL'];
+      const params = [];
+      const anioDesde = parseInt(req.query.anioDesde, 10), mesDesde = parseInt(req.query.mesDesde, 10);
+      const anioHasta = parseInt(req.query.anioHasta, 10), mesHasta = parseInt(req.query.mesHasta, 10);
+      if (anioDesde && mesDesde) { params.push(anioDesde * 12 + (mesDesde - 1)); cond.push(`(anio_cr*12+(mes_cr-1)) >= $${params.length}`); }
+      if (anioHasta && mesHasta) { params.push(anioHasta * 12 + (mesHasta - 1)); cond.push(`(anio_cr*12+(mes_cr-1)) <= $${params.length}`); }
+      const tienda = canal === 'realzza' ? tiendaRzParam(req.query.tienda) : '';
+      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+      const { rows } = await pgPool.query(
+        `SELECT COALESCE(NULLIF(TRIM(embudo),''),'SIN ASESOR') AS asesor,
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE modificado_por IS NULL OR TRIM(modificado_por) = '')::int AS sin_responder
+         FROM ${c.tabla}
+         WHERE ${cond.join(' AND ')} ${filtroTienda}
+         GROUP BY 1 ORDER BY total DESC`, params);
+      res.json(rows);
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}/por-asesor:`, error);
+      res.status(500).json({ success: false, message: 'No se pudieron obtener los leads por asesor.' });
+    }
+  });
 }
 registrarLeads('call', 'leads-kommo-call');
 registrarLeads('realzza', 'leads-kommo-realzza');
