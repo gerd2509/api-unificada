@@ -961,6 +961,15 @@ app.post('/gestion-kommo/lead-match', async (req, res) => {
     const cond = [`canal = $1`, `fecha_lead_asignado ~ '^\\d{1,2}/\\d{1,2}/\\d{4}'`];
     const params = [canal];
     if (b.soloMP) cond.push(`UPPER(TRIM(market_place)) IN ('SI','SÍ')`);
+    // Realzza (Chiclayo/Piura/Lima): aquí SÍ hay columna `sede` propia (viene del
+    // formulario de Registro Kommo), a diferencia del Excel masivo que solo trae el
+    // Embudo de ventas — se filtra directo por sede, sin necesidad de parsear nombres.
+    if (canal === 'REALZZA') {
+      const tienda = (b.tienda || '').toString().trim().toUpperCase();
+      if (tienda === 'REALZZA PIURA') cond.push(`UPPER(sede) LIKE '%PIURA%'`);
+      else if (tienda === 'REALZZA LIMA') cond.push(`UPPER(sede) LIKE '%LIMA%'`);
+      else if (tienda === 'REALZZA') cond.push(`UPPER(sede) NOT LIKE '%PIURA%' AND UPPER(sede) NOT LIKE '%LIMA%'`);
+    }
     params.push(dnis);
     const sql = `
       SELECT regexp_replace(dni_cliente, '\\D', '', 'g') AS dni,

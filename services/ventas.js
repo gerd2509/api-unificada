@@ -1944,16 +1944,23 @@ function registrarLeads(canal, ruta) {
     if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
     try {
       await ensureLeadsSchema(canal);
+      // Realzza (Chiclayo/Piura/Lima): el Embudo de ventas de Kommo trae el nombre del
+      // asesor seguido de 'PIURA'/'LIMA' cuando el lead es de esa tienda; sin sufijo =
+      // Chiclayo. tiendaRzParam/sedeTiendaSQL son los mismos helpers de Ventas Realzza.
+      const tienda = canal === 'realzza' ? tiendaRzParam(req.query.tienda) : '';
+      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
       if (req.query.por === 'dia') {
         const params = []; let where = 'WHERE dia_cr IS NOT NULL AND mes_cr IS NOT NULL AND anio_cr IS NOT NULL';
         if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); where += ` AND anio_cr = $${params.length}`; }
+        where += ` ${filtroTienda}`;
         const { rows } = await pgPool.query(
           `SELECT anio_cr AS anio, mes_cr AS mes, dia_cr AS dia, COUNT(*)::int AS total FROM ${c.tabla} ${where}
            GROUP BY anio_cr, mes_cr, dia_cr ORDER BY anio_cr, mes_cr, dia_cr`, params);
         return res.json(rows);
       }
-      const params = []; let where = '';
-      if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); where = 'WHERE anio_cr = $1'; }
+      const params = []; let where = 'WHERE 1=1';
+      if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); where += ` AND anio_cr = $${params.length}`; }
+      where += ` ${filtroTienda}`;
       const { rows } = await pgPool.query(
         `SELECT anio_cr AS anio, mes_cr AS mes, COUNT(*)::int AS total FROM ${c.tabla} ${where}
          GROUP BY anio_cr, mes_cr ORDER BY anio_cr, mes_cr`, params);
