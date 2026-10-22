@@ -2073,7 +2073,7 @@ function registrarLeads(canal, ruta) {
       const tienda = tiendaRzParam(req.query.tienda);
       const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
       const { rows } = await pgPool.query(
-        `SELECT id, nombre_cliente, embudo, estado, responsable,
+        `SELECT id, nombre_cliente, embudo, estado, responsable, etiquetas,
                 (dia_cr || '/' || mes_cr || '/' || anio_cr) AS fecha_creacion,
                 ultima_modificacion, modificado_por,
                 (modificado_por IS NOT NULL AND TRIM(modificado_por) <> '') AS respondido
