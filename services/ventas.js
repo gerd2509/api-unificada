@@ -1819,6 +1819,7 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
 const LEADS_COLS = [
   'id', 'nombre_lead', 'contacto_principal', 'responsable', 'embudo',
   'dia_cr', 'mes_cr', 'anio_cr', 'ultima_modificacion', 'modificado_por', 'etiquetas',
+  'nombre_cliente', 'estado',
 ];
 // Parser tolerante para la "Fecha de creación" de Kommo (dd.mm.yyyy / dd/mm/yyyy,
 // con o sin hora). Devuelve {d, m, y}.
@@ -1852,6 +1853,8 @@ function mapLeadRow(r) {
     toStr(pickCol(r, 'Última modificación el', 'Ultima modificacion el', 'ultima_modificacion')),
     toStr(pickCol(r, 'Modificado por', 'modificado_por')),
     toStr(pickCol(r, 'Etiquetas del lead', 'etiquetas')),
+    toStr(pickCol(r, 'Nombre del cliente', 'nombre_cliente')),
+    toStr(pickCol(r, 'Estado', 'estado')),
   ];
 }
 const leadsDdl = (t) => `
@@ -1863,6 +1866,8 @@ const leadsDdl = (t) => `
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   );
+  ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS nombre_cliente TEXT;
+  ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS estado TEXT;
   CREATE INDEX IF NOT EXISTS ix_${t}_anio_mes ON ${t} (anio_cr, mes_cr);`;
 const LEADS = {
   call:    { tabla: 'leads_kommo_call',    cargas: 'leads_kommo_call_cargas' },
@@ -1893,6 +1898,76 @@ async function upsertLeadsChunk(client, tabla, chunk) {
   let inserted = 0; for (const r of rows) if (r.inserted) inserted++;
   return { inserted, updated: rows.length - inserted };
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔌 KOMMO API — sincronización directa de leads (reemplaza la subida manual del
+// Excel). Usa el token de larga duración de la integración privada "Conversaciones
+// Koomo" (KOMMO_LONG_LIVED_TOKEN/KOMMO_SUBDOMAIN en el .env). Solo lee metadata del
+// lead (quién, cuándo, en qué embudo/estado) — el CONTENIDO del chat sigue sin
+// disponible hasta que Kommo vincule el canal de mensajería a esta integración.
+// ─────────────────────────────────────────────────────────────────────────────
+async function kommoFetch(path) {
+  const token = process.env.KOMMO_LONG_LIVED_TOKEN;
+  const sub = process.env.KOMMO_SUBDOMAIN;
+  if (!token || !sub) throw new Error('Kommo no configurado (faltan KOMMO_LONG_LIVED_TOKEN / KOMMO_SUBDOMAIN en el .env).');
+  const resp = await fetch(`https://${sub}.kommo.com${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (resp.status === 204) return null;
+  if (!resp.ok) throw new Error(`Kommo API ${path} -> ${resp.status}`);
+  return resp.json();
+}
+// unix seconds (Kommo) → {d,m,y,raw} en America/Lima (mismo criterio que ahoraLima() en gestion.js).
+function kommoFechaLima(unixSeconds) {
+  if (!unixSeconds) return { d: null, m: null, y: null, raw: '' };
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Lima', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date(unixSeconds * 1000));
+  const p = {}; for (const x of parts) if (x.type !== 'literal') p[x.type] = x.value;
+  const hh = p.hour === '24' ? '00' : p.hour;
+  return { d: +p.day, m: +p.month, y: +p.year, raw: `${+p.day}/${+p.month}/${+p.year} ${hh}:${p.minute}` };
+}
+// Embudos (pipelines) + estados (statuses, por pipeline) + usuarios — cambian poco,
+// se cachean 10 min para no pedirlos en cada sync.
+let kommoMapasCache = null, kommoMapasTs = 0;
+async function kommoMapas() {
+  if (kommoMapasCache && (Date.now() - kommoMapasTs) < 10 * 60 * 1000) return kommoMapasCache;
+  const [pipelinesRes, usersRes] = await Promise.all([
+    kommoFetch('/api/v4/leads/pipelines'),
+    kommoFetch('/api/v4/users?limit=250'),
+  ]);
+  const embudos = new Map(), estados = new Map();
+  for (const p of pipelinesRes?._embedded?.pipelines || []) {
+    embudos.set(p.id, p.name);
+    for (const s of p._embedded?.statuses || []) estados.set(s.id, s.name);
+  }
+  const usuarios = new Map();
+  for (const u of usersRes?._embedded?.users || []) usuarios.set(u.id, u.name);
+  kommoMapasCache = { embudos, estados, usuarios };
+  kommoMapasTs = Date.now();
+  return kommoMapasCache;
+}
+// Leads creados en [desdeUnix, hastaUnix], paginando, con el nombre real del cliente
+// (contacto principal) resuelto en lotes de /api/v4/contacts.
+async function kommoListarLeads(desdeUnix, hastaUnix) {
+  const leads = [];
+  for (let page = 1; page <= 200; page++) {
+    const data = await kommoFetch(`/api/v4/leads?filter[created_at][from]=${desdeUnix}&filter[created_at][to]=${hastaUnix}&with=contacts&limit=250&page=${page}`);
+    const lote = data?._embedded?.leads || [];
+    leads.push(...lote);
+    if (!data?._links?.next || lote.length < 250) break;
+  }
+  const idsContacto = [...new Set(leads.map(l => l._embedded?.contacts?.[0]?.id).filter(Boolean))];
+  const nombresContacto = new Map();
+  for (let i = 0; i < idsContacto.length; i += 100) {
+    const lote = idsContacto.slice(i, i + 100);
+    const qs = lote.map(id => `filter[id][]=${id}`).join('&');
+    const data = await kommoFetch(`/api/v4/contacts?${qs}&limit=250`);
+    for (const c of data?._embedded?.contacts || []) nombresContacto.set(c.id, c.name);
+  }
+  return leads.map(l => ({ ...l, _nombreContacto: nombresContacto.get(l._embedded?.contacts?.[0]?.id) || '' }));
+}
+
 function registrarLeads(canal, ruta) {
   const c = LEADS[canal];
   app.post(`/${ruta}/import`, upload.single('archivo'), async (req, res) => {
@@ -1926,6 +2001,91 @@ function registrarLeads(canal, ruta) {
       res.status(500).json({ success: false, message: 'No se pudo importar el archivo.' });
     }
   });
+  // Esta cuenta de Kommo es SOLO de Realzza — Call tiene su propia cuenta de Kommo
+  // aparte (no esta) y sigue 100% con el Excel manual, sin tocar.
+  if (canal === 'realzza') {
+  // POST /{ruta}/sync-kommo?anio=&mes= — trae los leads creados ese mes DIRECTO de
+  // la API de Kommo (reemplaza la subida manual del Excel). Guarda ID, nombre del
+  // cliente, embudo, estado, fechas y quién modificó por última vez (para saber si
+  // está respondido) en la misma tabla que ya usan Maduración de Leads y Embudos.
+  app.post(`/${ruta}/sync-kommo`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      const hoy = new Date();
+      const anio = parseInt(req.query.anio, 10) || hoy.getFullYear();
+      const mes = parseInt(req.query.mes, 10) || (hoy.getMonth() + 1);
+      const desdeUnix = Math.floor(new Date(anio, mes - 1, 1).getTime() / 1000);
+      const hastaUnix = Math.floor(new Date(anio, mes, 1).getTime() / 1000) - 1;
+
+      const [leads, mapas] = await Promise.all([kommoListarLeads(desdeUnix, hastaUnix), kommoMapas()]);
+      const rows = leads.map(l => {
+        const creado = kommoFechaLima(l.created_at);
+        const modificado = kommoFechaLima(l.updated_at);
+        const tags = (l._embedded?.tags || []).map(t => t.name).join(', ');
+        return [
+          l.id,
+          l.name || `Lead #${l.id}`,
+          '',
+          mapas.usuarios.get(l.responsible_user_id) || '',
+          mapas.embudos.get(l.pipeline_id) || '',
+          creado.d, creado.m, creado.y,
+          modificado.raw,
+          l.updated_by ? (mapas.usuarios.get(l.updated_by) || '') : '',
+          tags,
+          l._nombreContacto,
+          mapas.estados.get(l.status_id) || '',
+        ];
+      });
+
+      await ensureLeadsSchema(canal);
+      let insertados = 0, actualizados = 0;
+      if (rows.length) {
+        const client = await pgPool.connect();
+        try {
+          await client.query('BEGIN');
+          const CHUNK = 500;
+          for (let i = 0; i < rows.length; i += CHUNK) {
+            const r = await upsertLeadsChunk(client, c.tabla, rows.slice(i, i + CHUNK));
+            insertados += r.inserted; actualizados += r.updated;
+          }
+          await client.query(`INSERT INTO ${c.cargas} (cargado_por, archivo, filas, insertados, actualizados) VALUES ($1,$2,$3,$4,$5)`,
+            [toStr(req.body && req.body.cargado_por) || 'Sincronización Kommo API', `Kommo API ${anio}-${String(mes).padStart(2, '0')}`, rows.length, insertados, actualizados]);
+          await client.query('COMMIT');
+        } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+      }
+      res.json({ success: true, filas: rows.length, insertados, actualizados, updated_at: new Date().toISOString() });
+    } catch (error) {
+      console.error(`❌ Error en POST /${ruta}/sync-kommo:`, error);
+      res.status(500).json({ success: false, message: error.message || 'No se pudo sincronizar con Kommo.' });
+    }
+  });
+  // GET /{ruta}/listado?anio=&mes=&tienda= — listado de leads (ID, nombre del
+  // cliente, embudo, estado, fechas, quién modificó) para ver de un vistazo si cada
+  // lead está respondido (modificado_por vacío = sin responder).
+  app.get(`/${ruta}/listado`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureLeadsSchema(canal);
+      const cond = ['anio_cr IS NOT NULL', 'mes_cr IS NOT NULL'];
+      const params = [];
+      if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`anio_cr = $${params.length}`); }
+      if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`mes_cr = $${params.length}`); }
+      const tienda = tiendaRzParam(req.query.tienda);
+      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+      const { rows } = await pgPool.query(
+        `SELECT id, nombre_cliente, embudo, estado, responsable,
+                (dia_cr || '/' || mes_cr || '/' || anio_cr) AS fecha_creacion,
+                ultima_modificacion, modificado_por,
+                (modificado_por IS NOT NULL AND TRIM(modificado_por) <> '') AS respondido
+         FROM ${c.tabla} WHERE ${cond.join(' AND ')} ${filtroTienda}
+         ORDER BY anio_cr DESC, mes_cr DESC, dia_cr DESC, id DESC`, params);
+      res.json(rows);
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}/listado:`, error);
+      res.status(500).json({ success: false, message: 'No se pudo obtener el listado.' });
+    }
+  });
+  }
   app.get(`/${ruta}/estado`, async (req, res) => {
     if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
     try {
