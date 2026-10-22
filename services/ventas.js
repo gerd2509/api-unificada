@@ -1978,8 +1978,10 @@ function registrarLeads(canal, ruta) {
       await ensureLeadsSchema(canal);
       const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
       const mes = parseInt(req.query.mes, 10) || (new Date().getMonth() + 1);
+      const tienda = canal === 'realzza' ? tiendaRzParam(req.query.tienda) : '';
+      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
       const { rows } = await pgPool.query(
-        `SELECT id, nombre_lead, responsable, modificado_por FROM ${c.tabla} WHERE anio_cr = $1 AND mes_cr = $2`,
+        `SELECT id, nombre_lead, responsable, modificado_por FROM ${c.tabla} WHERE anio_cr = $1 AND mes_cr = $2 ${filtroTienda}`,
         [anio, mes]);
       res.json(rows);
     } catch (error) {
