@@ -1819,7 +1819,7 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
 const LEADS_COLS = [
   'id', 'nombre_lead', 'contacto_principal', 'responsable', 'embudo',
   'dia_cr', 'mes_cr', 'anio_cr', 'ultima_modificacion', 'modificado_por', 'etiquetas',
-  'nombre_cliente', 'estado',
+  'nombre_cliente', 'estado', 'pipeline_id', 'status_id', 'responsible_user_id',
 ];
 // Parser tolerante para la "Fecha de creación" de Kommo (dd.mm.yyyy / dd/mm/yyyy,
 // con o sin hora). Devuelve {d, m, y}.
@@ -1855,6 +1855,7 @@ function mapLeadRow(r) {
     toStr(pickCol(r, 'Etiquetas del lead', 'etiquetas')),
     toStr(pickCol(r, 'Nombre del cliente', 'nombre_cliente')),
     toStr(pickCol(r, 'Estado', 'estado')),
+    null, null, null, // pipeline_id/status_id/responsible_user_id: no vienen en el Excel
   ];
 }
 const leadsDdl = (t) => `
@@ -1868,7 +1869,11 @@ const leadsDdl = (t) => `
   );
   ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS nombre_cliente TEXT;
   ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS estado TEXT;
-  CREATE INDEX IF NOT EXISTS ix_${t}_anio_mes ON ${t} (anio_cr, mes_cr);`;
+  ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS pipeline_id BIGINT;
+  ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS status_id BIGINT;
+  ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS responsible_user_id BIGINT;
+  CREATE INDEX IF NOT EXISTS ix_${t}_anio_mes ON ${t} (anio_cr, mes_cr);
+  CREATE INDEX IF NOT EXISTS ix_${t}_pipeline ON ${t} (pipeline_id);`;
 const LEADS = {
   call:    { tabla: 'leads_kommo_call',    cargas: 'leads_kommo_call_cargas' },
   realzza: { tabla: 'leads_kommo_realzza', cargas: 'leads_kommo_realzza_cargas' },
@@ -1945,11 +1950,10 @@ function kommoFechaLima(unixSeconds) {
   const hh = p.hour === '24' ? '00' : p.hour;
   return { d: +p.day, m: +p.month, y: +p.year, raw: `${+p.day}/${+p.month}/${+p.year} ${hh}:${p.minute}` };
 }
-// Embudos (pipelines) + estados (statuses, por pipeline) + usuarios — cambian poco,
-// se cachean 10 min para no pedirlos en cada sync.
-let kommoMapasCache = null, kommoMapasTs = 0;
+// Embudos (pipelines) + estados (statuses, por pipeline) + usuarios. SIEMPRE se
+// piden frescos (sin caché): si alguien renombra un embudo en Kommo, el próximo
+// sync debe reflejarlo de inmediato — son solo 2 llamadas extra, nada caro.
 async function kommoMapas() {
-  if (kommoMapasCache && (Date.now() - kommoMapasTs) < 10 * 60 * 1000) return kommoMapasCache;
   const [pipelinesRes, usersRes] = await Promise.all([
     kommoFetch('/api/v4/leads/pipelines'),
     kommoFetch('/api/v4/users?limit=250'),
@@ -1961,9 +1965,7 @@ async function kommoMapas() {
   }
   const usuarios = new Map();
   for (const u of usersRes?._embedded?.users || []) usuarios.set(u.id, u.name);
-  kommoMapasCache = { embudos, estados, usuarios };
-  kommoMapasTs = Date.now();
-  return kommoMapasCache;
+  return { embudos, estados, usuarios };
 }
 // Corre `trabajador` sobre `items` con a lo más `limite` llamadas en paralelo a la
 // vez (evita saturar el rate-limit de Kommo pidiendo todo de un solo golpe).
@@ -2114,6 +2116,9 @@ function registrarLeads(canal, ruta) {
           tags,
           l._nombreContacto,
           mapas.estados.get(l.status_id) || '',
+          l.pipeline_id || null,
+          l.status_id || null,
+          l.responsible_user_id || null,
         ];
       });
 
@@ -2126,6 +2131,21 @@ function registrarLeads(canal, ruta) {
           const r = await upsertLeadsChunk(client, c.tabla, rows.slice(i, i + CHUNK));
           insertados += r.inserted; actualizados += r.updated;
         }
+        // Renombrar un embudo/estado/asesor en Kommo NO toca el updated_at de cada
+        // lead dentro de él, así que un sync incremental nunca los vuelve a traer.
+        // Por eso, SIEMPRE (con o sin leads nuevos) se refresca el texto de TODOS
+        // los leads ya guardados contra el mapa de nombres recién pedido, por ID.
+        const remapear = async (columna, idCol, mapa) => {
+          if (!mapa.size) return;
+          await client.query(
+            `UPDATE ${c.tabla} AS t SET ${columna} = m.nombre
+             FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::text[]) AS nombre) AS m
+             WHERE t.${idCol} = m.id AND t.${columna} IS DISTINCT FROM m.nombre`,
+            [[...mapa.keys()], [...mapa.values()]]);
+        };
+        await remapear('embudo', 'pipeline_id', mapas.embudos);
+        await remapear('estado', 'status_id', mapas.estados);
+        await remapear('responsable', 'responsible_user_id', mapas.usuarios);
         // Se registra SIEMPRE (incluso con 0 filas) con el momento en que arrancó
         // este sync como marca de tiempo — así el próximo sync incremental sabe
         // desde dónde partir, sin importar si hubo cambios esta vez o no.
