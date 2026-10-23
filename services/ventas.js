@@ -1905,15 +1905,33 @@ async function upsertLeadsChunk(client, tabla, chunk) {
 // lead (quién, cuándo, en qué embudo/estado) — el CONTENIDO del chat sigue sin
 // disponible hasta que Kommo vincule el canal de mensajería a esta integración.
 // ─────────────────────────────────────────────────────────────────────────────
-async function kommoFetch(path) {
+async function kommoFetch(path, intento = 1) {
   const token = process.env.KOMMO_LONG_LIVED_TOKEN;
   const sub = process.env.KOMMO_SUBDOMAIN;
   if (!token || !sub) throw new Error('Kommo no configurado (faltan KOMMO_LONG_LIVED_TOKEN / KOMMO_SUBDOMAIN en el .env).');
-  const resp = await fetch(`https://${sub}.kommo.com${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    signal: AbortSignal.timeout(30000),
-  });
+  let resp;
+  try {
+    resp = await fetch(`https://${sub}.kommo.com${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch (e) {
+    // Error de red (socket cerrado, timeout, DNS…) — normal en una sincronización
+    // larga de miles de llamadas. Reintenta con backoff en vez de tirar todo el sync.
+    if (intento <= 5) {
+      await new Promise(r => setTimeout(r, intento * 1000));
+      return kommoFetch(path, intento + 1);
+    }
+    throw e;
+  }
   if (resp.status === 204) return null;
+  // Rate-limit de Kommo (429) o error transitorio del lado del servidor: reintenta
+  // con backoff en vez de tirar el sync completo por una sola llamada saturada.
+  if ((resp.status === 429 || resp.status >= 500) && intento <= 5) {
+    const espera = Number(resp.headers.get('Retry-After')) * 1000 || intento * 1000;
+    await new Promise(r => setTimeout(r, espera));
+    return kommoFetch(path, intento + 1);
+  }
   if (!resp.ok) throw new Error(`Kommo API ${path} -> ${resp.status}`);
   return resp.json();
 }
@@ -1947,25 +1965,66 @@ async function kommoMapas() {
   kommoMapasTs = Date.now();
   return kommoMapasCache;
 }
-// Leads creados en [desdeUnix, hastaUnix], paginando, con el nombre real del cliente
-// (contacto principal) resuelto en lotes de /api/v4/contacts.
-async function kommoListarLeads(desdeUnix, hastaUnix) {
-  const leads = [];
-  for (let page = 1; page <= 200; page++) {
-    const data = await kommoFetch(`/api/v4/leads?filter[created_at][from]=${desdeUnix}&filter[created_at][to]=${hastaUnix}&with=contacts&limit=250&page=${page}`);
-    const lote = data?._embedded?.leads || [];
-    leads.push(...lote);
-    if (!data?._links?.next || lote.length < 250) break;
+// Corre `trabajador` sobre `items` con a lo más `limite` llamadas en paralelo a la
+// vez (evita saturar el rate-limit de Kommo pidiendo todo de un solo golpe).
+async function kommoConcurrente(items, limite, trabajador) {
+  const resultados = new Array(items.length);
+  let i = 0;
+  async function siguiente() {
+    while (i < items.length) {
+      const idx = i++;
+      resultados[idx] = await trabajador(items[idx], idx);
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(limite, items.length) }, siguiente));
+  return resultados;
+}
+// Trae TODOS los leads que cumplan el filtro dado (query string de /api/v4/leads),
+// paginando por ventanas de 5 páginas en paralelo hasta agotar resultados (una
+// cuenta con decenas de miles de leads sería demasiado lenta pidiendo de a una).
+async function kommoListarLeadsPorFiltro(filtroQS) {
+  const leads = [];
+  const VENTANA = 3;
+  for (let base = 1; base <= 300; base += VENTANA) {
+    const paginas = Array.from({ length: VENTANA }, (_, i) => base + i);
+    const resultados = await kommoConcurrente(paginas, VENTANA, p =>
+      kommoFetch(`/api/v4/leads?${filtroQS}&with=contacts&limit=250&page=${p}`).catch(() => null));
+    let terminado = false;
+    for (const data of resultados) {
+      const lote = data?._embedded?.leads || [];
+      leads.push(...lote);
+      if (!data || lote.length < 250) terminado = true;
+    }
+    if (terminado) break;
+  }
+  return leads;
+}
+// Resuelve el nombre real del cliente (contacto principal) en lotes de /api/v4/contacts
+// (5 lotes en paralelo a la vez) y lo agrega como _nombreContacto en cada lead.
+async function kommoResolverNombresContacto(leads) {
   const idsContacto = [...new Set(leads.map(l => l._embedded?.contacts?.[0]?.id).filter(Boolean))];
+  const lotes = [];
+  for (let i = 0; i < idsContacto.length; i += 100) lotes.push(idsContacto.slice(i, i + 100));
   const nombresContacto = new Map();
-  for (let i = 0; i < idsContacto.length; i += 100) {
-    const lote = idsContacto.slice(i, i + 100);
+  await kommoConcurrente(lotes, 3, async lote => {
     const qs = lote.map(id => `filter[id][]=${id}`).join('&');
     const data = await kommoFetch(`/api/v4/contacts?${qs}&limit=250`);
     for (const c of data?._embedded?.contacts || []) nombresContacto.set(c.id, c.name);
-  }
+  });
   return leads.map(l => ({ ...l, _nombreContacto: nombresContacto.get(l._embedded?.contacts?.[0]?.id) || '' }));
+}
+// TODOS los leads de la cuenta (sin filtrar por fecha), paginando hasta agotarlos.
+// Un lead viejo (de cualquier mes) con una etiqueta o respuesta nueva debe
+// refrescarse igual que uno del mes actual — por eso el sync no se limita a un
+// rango de fechas, trae y actualiza la cuenta completa cada vez.
+async function kommoListarLeads() {
+  const todos = await kommoListarLeadsPorFiltro('order[updated_at]=desc');
+  // Paginar ordenando por updated_at en una cuenta con actividad constante puede
+  // repetir un lead en dos páginas si se reordena justo entre pedidos — se
+  // deduplica por ID antes de armar las filas a insertar.
+  const porId = new Map();
+  for (const l of todos) porId.set(l.id, l);
+  return kommoResolverNombresContacto([...porId.values()]);
 }
 
 function registrarLeads(canal, ruta) {
@@ -2004,20 +2063,21 @@ function registrarLeads(canal, ruta) {
   // Esta cuenta de Kommo es SOLO de Realzza — Call tiene su propia cuenta de Kommo
   // aparte (no esta) y sigue 100% con el Excel manual, sin tocar.
   if (canal === 'realzza') {
-  // POST /{ruta}/sync-kommo?anio=&mes= — trae los leads creados ese mes DIRECTO de
-  // la API de Kommo (reemplaza la subida manual del Excel). Guarda ID, nombre del
-  // cliente, embudo, estado, fechas y quién modificó por última vez (para saber si
-  // está respondido) en la misma tabla que ya usan Maduración de Leads y Embudos.
+  // POST /{ruta}/sync-kommo?anio=&mes= — trae TODOS los leads de la cuenta DIRECTO
+  // de la API de Kommo (reemplaza la subida manual del Excel). No se limita al mes
+  // seleccionado: un lead viejo con una etiqueta o respuesta nueva debe quedar igual
+  // de al día, así que cada sync trae y actualiza la cuenta completa. anio/mes solo
+  // quedan para identificar la carga en el historial. Guarda ID, nombre del cliente,
+  // embudo, estado, fechas y quién modificó por última vez (para saber si está
+  // respondido) en la misma tabla que ya usan Maduración de Leads y Embudos.
   app.post(`/${ruta}/sync-kommo`, async (req, res) => {
     if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
     try {
       const hoy = new Date();
       const anio = parseInt(req.query.anio, 10) || hoy.getFullYear();
       const mes = parseInt(req.query.mes, 10) || (hoy.getMonth() + 1);
-      const desdeUnix = Math.floor(new Date(anio, mes - 1, 1).getTime() / 1000);
-      const hastaUnix = Math.floor(new Date(anio, mes, 1).getTime() / 1000) - 1;
 
-      const [leads, mapas] = await Promise.all([kommoListarLeads(desdeUnix, hastaUnix), kommoMapas()]);
+      const [leads, mapas] = await Promise.all([kommoListarLeads(), kommoMapas()]);
       const rows = leads.map(l => {
         const creado = kommoFechaLima(l.created_at);
         const modificado = kommoFechaLima(l.updated_at);
