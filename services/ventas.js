@@ -2658,6 +2658,37 @@ app.get('/reporte-global', async (req, res) => {
   } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /reporte-global-detalle?anio=&mes=&dia=&sede=sede1,sede2&entidad= → detalle de las
+// VENTAS (bruto del periodo, sin netear NC/incautaciones) que arman una celda del cuadro
+// "Aliados por Entidad × Sede": asesor, cliente, producto, monto y fecha, una fila por venta.
+// `sede` admite varios valores separados por coma (variantes del mismo sedeKey, p.ej. "Motupe"
+// y "SEDE RELENOR MOTUPE") — el front manda exactamente los textos de sede que agregó en el
+// cuadro, así que el match es exacto (sin reimplementar la normalización de sede acá).
+// `entidad` vacío/omitido = sin entidad (LEONCITO o nula).
+app.get('/reporte-global-detalle', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureVentasSchema();
+    const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
+    const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;
+    const dia = req.query.dia ? parseInt(req.query.dia, 10) : 0;
+    const sedes = String(req.query.sede || '').split(',').map(s => s.trim()).filter(Boolean);
+    const entidad = String(req.query.entidad || '').trim().toUpperCase();
+    if (!sedes.length) return res.json([]);
+    const { rows } = await pgPool.query(`
+      SELECT vendedor, cliente_venta AS cliente, productos AS producto,
+        ROUND(monto_consolidado)::int AS monto, dia_cv, mes_cv, anio_cv
+      FROM ventas
+      WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+        AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+        AND sede = ANY($4::text[])
+        AND NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') IS NOT DISTINCT FROM NULLIF($5,'')
+      ORDER BY anio_cv DESC, mes_cv DESC, dia_cv DESC, monto_consolidado DESC`,
+      [anio, mes, dia, sedes, entidad]);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /reporte-global-detalle:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // GET /reporte-global-motos?anio=&mes= → motos a nivel detalle por (sede, credito, marca,
 //   tipo, vendedor) con el # NETO de motos (vendidas − NC/incautaciones arrastradas) y
 //   motos_bruto (solo ventas del periodo, sin restar NC/incautaciones arrastradas de otros
