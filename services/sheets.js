@@ -1228,6 +1228,31 @@ async function ensureCapSchema() {
   `);
   capSchemaLista = true;
 }
+
+// Cuando el CAP marca a un asesor como RENUNCIA, apaga también su cuenta de Seguridad
+// (si tiene una) — no alcanza con bloquearle el login (ya lo hace /auth/login): si la
+// cuenta sigue viéndose "activo" en la pantalla de Seguridad es confuso/engañoso.
+// Solo en un sentido: si vuelve a ACTIVO en el CAP, NO se reactiva sola la cuenta — eso
+// lo decide un admin a propósito (podría estar desactivada por otro motivo).
+async function desactivarUsuarioSiRenuncia(vendedor, dni) {
+  if (!pgPool) return;
+  const v = (vendedor || '').toString().trim();
+  const d = (dni || '').toString().trim();
+  if (!v && !d) return;
+  try {
+    await ensureUsuariosSchema();
+    await pgPool.query(
+      `UPDATE usuarios SET activo = false, actualizado_en = now()
+       WHERE activo = true
+         AND ( ($1 <> '' AND TRIM(COALESCE(dni,'')) = $1)
+            OR ($1 <> '' AND TRIM(usuario) = $1)
+            OR ($2 <> '' AND UPPER(TRIM(vendedor)) = UPPER(TRIM($2))) )`,
+      [d, v]
+    );
+  } catch (e) {
+    console.error('⚠️ No se pudo desactivar la cuenta de Seguridad tras marcar RENUNCIA:', e.message);
+  }
+}
 // Tablas maestras: cap_sedes (gerente/zona por sede) y cap_supervisores (por sede).
 // Se auto-siembran desde cap_asesores la primera vez (migración transparente).
 let capMaestrosLista = false;
@@ -1543,6 +1568,7 @@ app.post('/cap', async (req, res) => {
       String(b.dni ?? '').trim()];
     const { rows } = await pgPool.query(
       `INSERT INTO cap_asesores (${CAP_COLS.join(',')}) VALUES (${CAP_COLS.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, vals);
+    if (vals[6] === 'RENUNCIA') await desactivarUsuarioSiRenuncia(vendedor, vals[7]);
     res.json({ success: true, id: rows[0].id });
   } catch (e) { console.error('❌ POST /cap:', e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -1566,8 +1592,10 @@ app.put('/cap/:id', async (req, res) => {
     if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
     sets.push('actualizado_en = now()');
     vals.push(parseInt(req.params.id, 10));
-    const { rowCount } = await pgPool.query(`UPDATE cap_asesores SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+    const { rows, rowCount } = await pgPool.query(
+      `UPDATE cap_asesores SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING vendedor, dni, estado`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Asesor no encontrado.' });
+    if (rows[0].estado === 'RENUNCIA') await desactivarUsuarioSiRenuncia(rows[0].vendedor, rows[0].dni);
     res.json({ success: true });
   } catch (e) { console.error('❌ PUT /cap/:id:', e); res.status(500).json({ success: false, message: e.message }); }
 });
