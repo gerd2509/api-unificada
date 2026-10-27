@@ -10,18 +10,19 @@ const rateLimit = require('express-rate-limit');
 
 // ALLOWED_ORIGINS en el .env: lista separada por comas, sin espacios, p.ej.
 //   ALLOWED_ORIGINS=https://dashboard-leoncito.onrender.com
-// Si no está seteada (dev local), se permite el dev-server de Angular nomás.
+// Si NO está configurada, se permite cualquier origen (comportamiento de antes) —
+// nunca el default "más seguro" a costa de bloquear al propio frontend en
+// producción. En cuanto se setee ALLOWED_ORIGINS, ahí sí se restringe a esa lista.
 const origenesPermitidos = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
-const origenesDev = ['http://localhost:4200', 'http://127.0.0.1:4200'];
-const listaOrigenes = origenesPermitidos.length ? origenesPermitidos : origenesDev;
 
 const corsOptions = {
   origin(origin, cb) {
+    if (!origenesPermitidos.length) return cb(null, true);   // sin configurar → abierto
     // Sin origin = llamada no-browser (curl, health-check del hosting, servidor a
     // servidor) — se deja pasar. CORS es una política que solo aplica DENTRO del
     // navegador; no es un control de acceso real (eso lo hace la autenticación).
-    if (!origin || listaOrigenes.includes(origin)) return cb(null, true);
+    if (!origin || origenesPermitidos.includes(origin)) return cb(null, true);
     cb(null, false);   // origen no permitido → sin cabecera CORS (el navegador bloquea la lectura)
   },
 };
