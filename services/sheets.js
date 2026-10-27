@@ -1,18 +1,19 @@
 require('dotenv').config();
 const express = require('express');
 const { google } = require('googleapis');
-const cors = require('cors');
 const compression = require('compression');
 const { Pool } = require('pg');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const bcrypt = require('bcryptjs');
 
+const { aplicarSeguridad, limiteLogin } = require('./_security');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos bytes)
-app.use(cors());
+aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 // Límite alto porque el control del supervisor puede traer fotos en base64.
 app.use(express.json({ limit: '20mb' }));
 
@@ -254,7 +255,7 @@ app.get('/data/:sheetName', async (req, res) => {
 
 // 🔐 Login: POST /auth/login — valida SOLO contra la BD (usuarios), bcrypt.
 // El sheet ya no se usa en runtime (solo sirvió para la migración inicial).
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', limiteLogin, async (req, res) => {
   const { usuario, password } = req.body;
 
   if (!usuario || !password) {
@@ -309,7 +310,7 @@ app.post('/auth/login', async (req, res) => {
 
 // POST /auth/cambiar-password — el propio usuario cambia su clave (valida la actual).
 // Usado en el "forzar cambio en el primer login" y para autoservicio.
-app.post('/auth/cambiar-password', async (req, res) => {
+app.post('/auth/cambiar-password', limiteLogin, async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   const { usuario, actual, nueva } = req.body || {};
   if (!usuario || !actual || !nueva) return res.status(400).json({ success: false, message: 'Faltan datos.' });
@@ -819,7 +820,7 @@ app.post('/permisos/revocar-aula-virtual', async (req, res) => {
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('❌ POST /permisos/revocar-aula-virtual', e);
-    res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
   } finally { client.release(); }
 });
 
@@ -1100,7 +1101,7 @@ app.post('/gestion-sedes-deriv/sync', async (req, res) => {
     res.json({ success: true, leidas: data.length, insertados });
   } catch (e) {
     console.error('❌ POST /gestion-sedes-deriv/sync:', e);
-    res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
   }
 });
 
@@ -1127,7 +1128,7 @@ app.get('/gestion-sedes-deriv', async (req, res) => {
               fecha_interes_derivacion, hora_interes_derivacion, comentario_derivacion, origen
        FROM gestion_sedes_deriv ${where} ORDER BY ${FECHA} DESC`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /gestion-sedes-deriv:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /gestion-sedes-deriv:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // POST /gestion-sedes-deriv — registro de una derivación de venta desde la plataforma
@@ -1158,7 +1159,7 @@ app.post('/gestion-sedes-deriv', async (req, res) => {
     const { rows } = await pgPool.query(
       `INSERT INTO gestion_sedes_deriv (${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, vals);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /gestion-sedes-deriv:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /gestion-sedes-deriv:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /gestion-sedes-deriv/:id — editar una derivación (persiste en BD). El asesor va a la
@@ -1188,7 +1189,7 @@ app.put('/gestion-sedes-deriv/:id', async (req, res) => {
        toStr(b.fecha_interes_derivacion), toStr(b.hora_interes_derivacion), toStr(b.comentario_derivacion)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'No existe la derivación.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /gestion-sedes-deriv/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /gestion-sedes-deriv/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // DELETE /gestion-sedes-deriv/:id — elimina una derivación de la BD.
@@ -1201,7 +1202,7 @@ app.delete('/gestion-sedes-deriv/:id', async (req, res) => {
     const { rowCount } = await pgPool.query(`DELETE FROM gestion_sedes_deriv WHERE id = $1`, [id]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'No existe la derivación.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /gestion-sedes-deriv/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /gestion-sedes-deriv/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1362,7 +1363,7 @@ app.post('/cap/sync', async (req, res) => {
     res.json({ success: true, leidas: data.length, insertados });
   } catch (e) {
     console.error('❌ POST /cap/sync:', e);
-    res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
   }
 });
 
@@ -1388,7 +1389,7 @@ app.get('/cap', async (req, res) => {
        LEFT JOIN cap_sedes s ON upper(trim(s.nombre)) = upper(trim(a.sede))
        ${where} ORDER BY a.sede NULLS LAST, a.vendedor`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /cap:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /cap:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /cap/meta — catálogos para el formulario del Maestro CAP:
@@ -1409,7 +1410,7 @@ app.get('/cap/meta', async (req, res) => {
       supervisores: sup.rows,
       canales: canales.rows.map(r => r.canal),
     });
-  } catch (e) { console.error('❌ GET /cap/meta:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /cap/meta:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── Maestro de SEDES (cap_sedes): gerente + zona por sede ──────────────────────
@@ -1419,7 +1420,7 @@ app.get('/cap/sedes', async (req, res) => {
     await ensureCapMaestros(); res.set('Cache-Control', 'no-store');
     const { rows } = await pgPool.query(`SELECT id, nombre, gerente, zona FROM cap_sedes ORDER BY nombre`);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /cap/sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /cap/sedes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.post('/cap/sedes', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1434,7 +1435,7 @@ app.post('/cap/sedes', async (req, res) => {
        RETURNING id`,
       [nombre, String(b.gerente ?? '').trim(), String(b.zona ?? '').trim().toUpperCase()]);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /cap/sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /cap/sedes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.put('/cap/sedes/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1451,7 +1452,7 @@ app.put('/cap/sedes/:id', async (req, res) => {
     const { rowCount } = await pgPool.query(`UPDATE cap_sedes SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Sede no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /cap/sedes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /cap/sedes/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.delete('/cap/sedes/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1460,7 +1461,7 @@ app.delete('/cap/sedes/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM cap_sedes WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Sede no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /cap/sedes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /cap/sedes/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── Maestro de SUPERVISORES (cap_supervisores) por sede ────────────────────────
@@ -1473,7 +1474,7 @@ app.get('/cap/supervisores', async (req, res) => {
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(`SELECT id, nombre, sede FROM cap_supervisores ${where} ORDER BY sede, nombre`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /cap/supervisores:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /cap/supervisores:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.post('/cap/supervisores', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1486,7 +1487,7 @@ app.post('/cap/supervisores', async (req, res) => {
       `INSERT INTO cap_supervisores (nombre, sede) VALUES ($1,$2) RETURNING id`,
       [nombre, String(b.sede ?? '').trim()]);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /cap/supervisores:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /cap/supervisores:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.put('/cap/supervisores/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1502,7 +1503,7 @@ app.put('/cap/supervisores/:id', async (req, res) => {
     const { rowCount } = await pgPool.query(`UPDATE cap_supervisores SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Supervisor no encontrado.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /cap/supervisores/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /cap/supervisores/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.delete('/cap/supervisores/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1511,7 +1512,7 @@ app.delete('/cap/supervisores/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM cap_supervisores WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Supervisor no encontrado.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /cap/supervisores/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /cap/supervisores/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── Maestro de GERENTES (cap_gerentes) — se eligen al editar una sede ──────────
@@ -1521,7 +1522,7 @@ app.get('/cap/gerentes', async (req, res) => {
     await ensureCapMaestros(); res.set('Cache-Control', 'no-store');
     const { rows } = await pgPool.query(`SELECT id, nombre FROM cap_gerentes ORDER BY nombre`);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /cap/gerentes:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /cap/gerentes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.post('/cap/gerentes', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1532,7 +1533,7 @@ app.post('/cap/gerentes', async (req, res) => {
     const { rows } = await pgPool.query(
       `INSERT INTO cap_gerentes (nombre) VALUES ($1) ON CONFLICT (nombre) DO UPDATE SET actualizado_en=now() RETURNING id`, [nombre]);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /cap/gerentes:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /cap/gerentes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.put('/cap/gerentes/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1546,7 +1547,7 @@ app.put('/cap/gerentes/:id', async (req, res) => {
     await pgPool.query('UPDATE cap_gerentes SET nombre=$1, actualizado_en=now() WHERE id=$2', [nombre, parseInt(req.params.id, 10)]);
     await pgPool.query('UPDATE cap_sedes SET gerente=$1, actualizado_en=now() WHERE gerente=$2', [nombre, prev.rows[0].nombre]);
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /cap/gerentes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /cap/gerentes/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.delete('/cap/gerentes/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -1555,7 +1556,7 @@ app.delete('/cap/gerentes/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM cap_gerentes WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Gerente no encontrado.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /cap/gerentes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /cap/gerentes/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // POST /cap — alta de un asesor.
@@ -1574,7 +1575,7 @@ app.post('/cap', async (req, res) => {
       `INSERT INTO cap_asesores (${CAP_COLS.join(',')}) VALUES (${CAP_COLS.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, vals);
     if (vals[6] === 'RENUNCIA') await desactivarUsuarioSiRenuncia(vendedor, vals[7]);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /cap:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /cap:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /cap/:id — edición (solo los campos que llegan).
@@ -1601,7 +1602,7 @@ app.put('/cap/:id', async (req, res) => {
     if (!rowCount) return res.status(404).json({ success: false, message: 'Asesor no encontrado.' });
     if (rows[0].estado === 'RENUNCIA') await desactivarUsuarioSiRenuncia(rows[0].vendedor, rows[0].dni);
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /cap/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /cap/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // DELETE /cap/:id — baja definitiva (para "renuncia" usar estado=RENUNCIA con PUT).
@@ -1612,7 +1613,7 @@ app.delete('/cap/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM cap_asesores WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Asesor no encontrado.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /cap/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /cap/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /gestion-sedes-deriv/live — respuestas del formulario EN VIVO (lee la hoja, NO la BD).
@@ -1634,7 +1635,7 @@ app.get('/gestion-sedes-deriv/live', async (req, res) => {
     res.json(out);
   } catch (e) {
     console.error('❌ GET /gestion-sedes-deriv/live:', e);
-    res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
   }
 });
 

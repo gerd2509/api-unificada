@@ -8,15 +8,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
 const compression = require('compression');
 const { Pool } = require('pg');
+const { aplicarSeguridad } = require('./_security');
 
 const app = express();
 const PORT = process.env.PORT || 4004;
 
 app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos bytes)
-app.use(cors());
+aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 // Límite alto: el control del supervisor trae fotos en base64.
 app.use(express.json({ limit: '20mb' }));
 
@@ -307,7 +307,7 @@ app.post('/gestion/sync-sedes', async (req, res) => {
     res.json({ success: true, leidas: data.length, validas: filas.length, insertados, duplicados: filas.length - insertados, desde, hasta });
   } catch (e) {
     console.error('❌ POST /gestion/sync-sedes:', e);
-    res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
   }
 });
 
@@ -345,7 +345,7 @@ app.get('/gestion', async (req, res) => {
               detalle_contacto, celular_actualizado, detalle_no_desea, detalle_politica_fem, origen
        FROM gestion ${where} ORDER BY ${FECHA} DESC`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /gestion:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /gestion:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /gestion/evolucion?desde=&hasta= — agregado por día+sede (llamadas/cartas, en SQL)
@@ -379,7 +379,7 @@ app.get('/evolucion', async (req, res) => {
       porDia: porDia.rows.map(r => ({ dia: r.dia, sede: r.sede, llamadas: r.llamadas, cartas: r.cartas })),
       asesores: asesores.rows,
     });
-  } catch (e) { console.error('❌ GET /gestion/evolucion:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /gestion/evolucion:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /gestion/:id — edita una gestión (módulo Gestión Sede, como gestion-call/realzza).
@@ -399,7 +399,7 @@ app.put('/gestion/:id', async (req, res) => {
     const { rowCount } = await pgPool.query(`UPDATE gestion SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Gestión no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /gestion/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /gestion/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // DELETE /gestion/:id — elimina una gestión de la BD (no solo visual).
@@ -410,7 +410,7 @@ app.delete('/gestion/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM gestion WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Gestión no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /gestion/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /gestion/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -509,7 +509,7 @@ app.post('/call-sedes/sync', async (req, res) => {
       }
     } finally { client.release(); }
     res.json({ success: true, leidas: data.length, validas: filas.length, insertados, duplicados: filas.length - insertados });
-  } catch (e) { console.error('❌ POST /call-sedes/sync:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /call-sedes/sync:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /call-sedes?desde=&hasta=&sede= — lista call-sedes desde la BD (fuente única).
@@ -532,7 +532,7 @@ app.get('/call-sedes', async (req, res) => {
               ${CCS_MAP.map(([c]) => c).join(', ')}, origen
        FROM gestion_call_sedes ${where} ORDER BY ${FECHA} DESC`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /call-sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /call-sedes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // POST /call-sedes — registro MARKET PLACE desde la plataforma (origen 'app').
@@ -551,7 +551,7 @@ app.post('/call-sedes', async (req, res) => {
     const { rows } = await pgPool.query(
       `INSERT INTO gestion_call_sedes (${cols.join(',')}, marca_temporal) VALUES (${ph}, (now() AT TIME ZONE 'America/Lima')) RETURNING id`, vals);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /call-sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /call-sedes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /call-sedes/:id — edita; DELETE /call-sedes/:id — elimina (gestion-call-sedes editable).
@@ -567,7 +567,7 @@ app.put('/call-sedes/:id', async (req, res) => {
     const { rowCount } = await pgPool.query(`UPDATE gestion_call_sedes SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Registro no encontrado.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /call-sedes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /call-sedes/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.delete('/call-sedes/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -576,7 +576,7 @@ app.delete('/call-sedes/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM gestion_call_sedes WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Registro no encontrado.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /call-sedes/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /call-sedes/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1063,7 +1063,7 @@ app.post('/gestion-cobranza', async (req, res) => {
        txt(b.estado_contacto), txt(b.motivo_no_pago), txt(b.quien_respondio), txt(b.comentario_tercero),
        txt(b.resultado_gestion), txt(b.fecha_compromiso), num(b.monto_pagar), txt(b.observaciones)]);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /gestion-cobranza:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /gestion-cobranza:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /gestion-cobranza?desde&hasta&dni — lista (para un futuro módulo de control).
@@ -1085,7 +1085,7 @@ app.get('/gestion-cobranza', async (req, res) => {
               to_char(${FECHA}, 'DD/MM/YYYY HH24:MI:SS') AS marca
        FROM gestion_cobranza ${where} ORDER BY creado_en DESC`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /gestion-cobranza:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /gestion-cobranza:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1154,7 +1154,7 @@ app.post('/entregas', async (req, res) => {
       [dni, nz(b.cliente_nombre), nz(b.producto), nz(b.codigo_cv), b.fecha_entrega, nz(b.sede),
        nz(b.celular), nz(b.direccion), nz(b.coordenadas), nz(b.observacion), nz(b.registrado_por)]);
     res.json({ success: true, id: rows[0].id });
-  } catch (e) { console.error('❌ POST /entregas:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /entregas:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /entregas?desde&hasta&sede&estado&dni — lista (calendario / pendientes / reporte).
@@ -1179,7 +1179,7 @@ app.get('/entregas', async (req, res) => {
               (estado = 'PENDIENTE' AND fecha_entrega < (now() AT TIME ZONE 'America/Lima')::date) AS vencida
        FROM entregas ${where} ORDER BY fecha_entrega, id`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /entregas:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /entregas:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PATCH /entregas/entregar — marca varias como ENTREGADO (flujo de checks + Guardar).
@@ -1198,7 +1198,7 @@ app.patch('/entregas/entregar', async (req, res) => {
         : `UPDATE entregas SET estado='PENDIENTE', entregado_por=NULL, fecha_entregado=NULL, actualizado_en=now() WHERE id = ANY($1)`,
       marcar ? [ids, nz(b.entregado_por)] : [ids]);
     res.json({ success: true, actualizados: rowCount });
-  } catch (e) { console.error('❌ PATCH /entregas/entregar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PATCH /entregas/entregar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PATCH /entregas/reprogramar — nueva fecha + motivo para varias entregas (cliente no
@@ -1219,7 +1219,7 @@ app.patch('/entregas/reprogramar', async (req, res) => {
        WHERE id = ANY($1)`,
       [ids, b.fecha_entrega, nz(b.motivo)]);
     res.json({ success: true, actualizados: rowCount });
-  } catch (e) { console.error('❌ PATCH /entregas/reprogramar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PATCH /entregas/reprogramar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PATCH /entregas/asignar-vehiculo — asigna (o quita) el carro de reparto a varias
@@ -1235,7 +1235,7 @@ app.patch('/entregas/asignar-vehiculo', async (req, res) => {
     const { rowCount } = await pgPool.query(
       `UPDATE entregas SET vehiculo = $2, actualizado_en = now() WHERE id = ANY($1)`, [ids, veh]);
     res.json({ success: true, actualizados: rowCount });
-  } catch (e) { console.error('❌ PATCH /entregas/asignar-vehiculo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PATCH /entregas/asignar-vehiculo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PATCH /entregas/asignar-almacenero — asigna (o quita) el almacenero a varias entregas
@@ -1250,7 +1250,7 @@ app.patch('/entregas/asignar-almacenero', async (req, res) => {
     const { rowCount } = await pgPool.query(
       `UPDATE entregas SET almacenero = $2, actualizado_en = now() WHERE id = ANY($1)`, [ids, nz(b.almacenero)]);
     res.json({ success: true, actualizados: rowCount });
-  } catch (e) { console.error('❌ PATCH /entregas/asignar-almacenero:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PATCH /entregas/asignar-almacenero:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /entregas/:id — editar / reprogramar.
@@ -1279,7 +1279,7 @@ app.put('/entregas/:id', async (req, res) => {
       `UPDATE entregas SET ${campos.join(', ')}, actualizado_en = now() WHERE id = $${params.length}`, params);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Entrega no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /entregas/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /entregas/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // DELETE /entregas/:id
@@ -1290,7 +1290,7 @@ app.delete('/entregas/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM entregas WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Entrega no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /entregas/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /entregas/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1338,7 +1338,7 @@ app.post('/productos-inventario/bulk', async (req, res) => {
     } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
     const { rows: tot } = await pgPool.query('SELECT COUNT(*)::int n FROM productos_inventario');
     res.json({ success: true, recibidos: nombres.length, insertados, duplicados: nombres.length - insertados, total: tot[0].n });
-  } catch (e) { console.error('❌ POST /productos-inventario/bulk:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /productos-inventario/bulk:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /productos-inventario?q=&limit= — lista/búsqueda de productos (nombres).
@@ -1353,7 +1353,7 @@ app.get('/productos-inventario', async (req, res) => {
     const { rows } = await pgPool.query(
       `SELECT id, nombre FROM productos_inventario ${where} ORDER BY nombre LIMIT ${lim}`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /productos-inventario:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /productos-inventario:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // DELETE /productos-inventario/:id — elimina un producto del inventario.
@@ -1364,7 +1364,7 @@ app.delete('/productos-inventario/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM productos_inventario WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /productos-inventario/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /productos-inventario/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── Health ───────────────────────────────────────────────────────────────────

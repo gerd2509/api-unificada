@@ -8,16 +8,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
 const compression = require('compression');
 const multer = require('multer');
 const { Pool } = require('pg');
+const { aplicarSeguridad } = require('./_security');
 
 const app = express();
 const PORT = process.env.PORT || 4005;
 
 app.use(compression());
-app.use(cors());
+aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 app.use(express.json({ limit: '2mb' }));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 * 1024 * 1024 } });
@@ -139,7 +139,7 @@ async function ensureSchema() {
 }
 app.use(async (_req, res, next) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
-  try { await ensureSchema(); next(); } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  try { await ensureSchema(); next(); } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── Catálogo de insignias (fijo en código; se evalúan y se guardan cuando se ganan) ──
@@ -218,7 +218,7 @@ app.get('/admin/cursos', async (_req, res) => {
       FROM aula_cursos c LEFT JOIN aula_lecciones l ON l.curso_id = c.id AND l.activo
       GROUP BY c.id ORDER BY c.orden, c.id`);
     res.json(rows);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.post('/admin/cursos', async (req, res) => {
   try {
@@ -228,7 +228,7 @@ app.post('/admin/cursos', async (req, res) => {
       `INSERT INTO aula_cursos (titulo, descripcion, canal, icono, color, orden) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
       [titulo, descripcion || '', canal || 'todos', icono || 'school', color || '#1A5FAD', orden || 0]);
     res.json(rows[0]);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.put('/admin/cursos/:id', async (req, res) => {
   try {
@@ -240,11 +240,11 @@ app.put('/admin/cursos/:id', async (req, res) => {
       [req.params.id, titulo, descripcion, canal, icono, color, orden, activo]);
     if (!rows.length) return res.status(404).json({ success: false, message: 'Curso no encontrado.' });
     res.json(rows[0]);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.delete('/admin/cursos/:id', async (req, res) => {
   try { await pgPool.query('DELETE FROM aula_cursos WHERE id=$1', [req.params.id]); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── ADMIN — Lecciones ──────────────────────────────────────────────────────────
@@ -255,7 +255,7 @@ app.get('/admin/cursos/:id/lecciones', async (req, res) => {
       FROM aula_lecciones l LEFT JOIN aula_preguntas p ON p.leccion_id = l.id
       WHERE l.curso_id = $1 GROUP BY l.id ORDER BY l.orden, l.id`, [req.params.id]);
     res.json(rows);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.post('/admin/lecciones', upload.single('archivo'), async (req, res) => {
   try {
@@ -273,7 +273,7 @@ app.post('/admin/lecciones', upload.single('archivo'), async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
       [curso_id, titulo, archivo_path, archivo_nombre, orden || 0, xp || 100]);
     res.json(rows[0]);
-  } catch (e) { console.error('❌ POST /aula/admin/lecciones', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /aula/admin/lecciones', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.put('/admin/lecciones/:id', upload.single('archivo'), async (req, res) => {
   try {
@@ -292,11 +292,11 @@ app.put('/admin/lecciones/:id', upload.single('archivo'), async (req, res) => {
         activo=COALESCE($5,activo), curso_id=COALESCE($6,curso_id) ${archivoSet} WHERE id=$1 RETURNING *`, params);
     if (!rows.length) return res.status(404).json({ success: false, message: 'Lección no encontrada.' });
     res.json(rows[0]);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.delete('/admin/lecciones/:id', async (req, res) => {
   try { await pgPool.query('DELETE FROM aula_lecciones WHERE id=$1', [req.params.id]); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── ADMIN — Preguntas (generación por IA + edición/aprobación) ────────────────
@@ -304,7 +304,7 @@ app.get('/admin/lecciones/:id/preguntas', async (req, res) => {
   try {
     const { rows } = await pgPool.query('SELECT * FROM aula_preguntas WHERE leccion_id=$1 ORDER BY orden, id', [req.params.id]);
     res.json(rows);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.post('/admin/preguntas', async (req, res) => {
   try {
@@ -316,7 +316,7 @@ app.post('/admin/preguntas', async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,true,'manual') RETURNING *`,
       [leccion_id, pregunta, JSON.stringify(opciones), respuesta_correcta || 0, explicacion || '']);
     res.json(rows[0]);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.put('/admin/preguntas/:id', async (req, res) => {
   try {
@@ -328,11 +328,11 @@ app.put('/admin/preguntas/:id', async (req, res) => {
       [req.params.id, pregunta, opciones ? JSON.stringify(opciones) : null, respuesta_correcta, explicacion, aprobada]);
     if (!rows.length) return res.status(404).json({ success: false, message: 'Pregunta no encontrada.' });
     res.json(rows[0]);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 app.delete('/admin/preguntas/:id', async (req, res) => {
   try { await pgPool.query('DELETE FROM aula_preguntas WHERE id=$1', [req.params.id]); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -361,7 +361,7 @@ app.get('/cursos', async (req, res) => {
       return { ...c, total_lecciones: p.total, lecciones_completadas: p.completadas,
         pct: p.total > 0 ? Math.round((p.completadas / p.total) * 100) : 0 };
     }));
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 app.get('/cursos/:id/lecciones', async (req, res) => {
@@ -376,7 +376,7 @@ app.get('/cursos/:id/lecciones', async (req, res) => {
       LEFT JOIN aula_progreso p ON p.leccion_id = l.id AND p.vendedor = $2
       WHERE l.curso_id = $1 AND l.activo ORDER BY l.orden, l.id`, [req.params.id, vendedor]);
     res.json(rows);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 app.get('/lecciones/:id', async (req, res) => {
@@ -388,7 +388,7 @@ app.get('/lecciones/:id', async (req, res) => {
     // PPT/Word/Excel) termine de cargar sin que la URL firmada expire a medio visionado.
     const url = l.archivo_path ? await urlFirmada(l.archivo_path, 21600) : null;
     res.json({ ...l, url });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Marca la lección como vista (al terminar de revisar el PDF).
@@ -404,7 +404,7 @@ app.post('/lecciones/:id/visto', async (req, res) => {
     await registrarActividad(vendedor);
     const nuevas = await evaluarInsignias(vendedor);
     res.json({ success: true, nuevasInsignias: nuevas });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Preguntas del examen (SIN la respuesta correcta ni la explicación).
@@ -414,7 +414,7 @@ app.get('/lecciones/:id/examen', async (req, res) => {
       `SELECT id, pregunta, opciones FROM aula_preguntas WHERE leccion_id=$1 AND aprobada ORDER BY orden, id`,
       [req.params.id]);
     res.json(rows);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Envía respuestas → califica, guarda progreso/XP, evalúa insignias.
@@ -466,7 +466,7 @@ app.post('/lecciones/:id/examen', async (req, res) => {
       puntaje, correctas, total: preguntas.length, aprobado: aprobadoAhora, detalle,
       xpGanado: (!yaAprobada && aprobadoAhora) ? xpLeccion : 0, nuevasInsignias: nuevas,
     });
-  } catch (e) { console.error('❌ POST /aula/lecciones/:id/examen', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /aula/lecciones/:id/examen', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Mi progreso: XP total, nivel, racha, insignias.
@@ -488,7 +488,7 @@ app.get('/mi-progreso', async (req, res) => {
       racha, leccionesAprobadas: xpRows[0]?.lecciones_aprobadas || 0,
       insignias, insigniasTodas: INSIGNIAS,
     });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Ranking global por XP (top 20).
@@ -499,7 +499,7 @@ app.get('/ranking', async (_req, res) => {
       FROM aula_progreso p JOIN aula_lecciones l ON l.id = p.leccion_id
       WHERE p.aprobado GROUP BY p.vendedor ORDER BY xp DESC LIMIT 20`);
     res.json(rows.map((r, i) => ({ ...r, puesto: i + 1, nivel: nivelDe(r.xp) })));
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -524,7 +524,7 @@ app.get('/admin/progreso', async (_req, res) => {
     const { rows: totalRows } = await pgPool.query('SELECT COUNT(*)::int AS n FROM aula_lecciones WHERE activo');
     const totalLecciones = totalRows[0]?.n || 0;
     res.json(rows.map(r => ({ ...r, nivel: nivelDe(r.xp), total_lecciones: totalLecciones })));
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Detalle lección por lección de UN vendedor (para ver qué respondió y con qué nota).
@@ -545,7 +545,7 @@ app.get('/admin/progreso/:vendedor', async (req, res) => {
       'SELECT codigo, fecha FROM aula_insignias_vendedor WHERE vendedor=$1 ORDER BY fecha DESC', [vendedor]);
     const insignias = insigniasVend.map(iv => ({ ...INSIGNIAS.find(i => i.codigo === iv.codigo), fecha: iv.fecha })).filter(i => i.codigo);
     res.json({ detalle, insignias, racha: await calcularRacha(vendedor) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'aula-virtual', ts: new Date().toISOString() }));

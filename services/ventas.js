@@ -13,17 +13,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
 const compression = require('compression');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const { Pool } = require('pg');
+const { aplicarSeguridad } = require('./_security');
 
 const app = express();
 const PORT = process.env.PORT || 4003;
 
 app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos bytes)
-app.use(cors());
+aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 app.use(express.json({ limit: '20mb' }));
 
 // 🐘 PostgreSQL (Neon) — misma cadena que el monolito (variable DATABASE_URL).
@@ -409,7 +409,7 @@ app.get('/ventas/evolutivo', async (req, res) => {
       WHERE k.anio > 0 AND k.mes > 0
       ORDER BY k.anio, k.mes`)).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas/evolutivo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas/evolutivo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -844,7 +844,7 @@ app.post('/ventas-call/cruzar', async (req, res) => {
       WITH ${MAPA_SQL}
       SELECT COUNT(*)::int n FROM ventas v ${DERIV_LATERAL} ${totWhere}`, totParams);
     res.json({ success: true, actualizados: rows.length, total: tot[0].n });
-  } catch (e) { console.error('❌ POST /ventas-call/cruzar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /ventas-call/cruzar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-call/buscar?dni=&anio=&mes= — busca ese DNI en TODAS las afectaciones
@@ -866,7 +866,7 @@ app.get('/ventas-call/buscar', async (req, res) => {
       WHERE ${cond.join(' AND ')}
       ORDER BY v.fecha_cv DESC NULLS LAST`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-call/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-call/buscar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-call/atribucion?anio=&mes= — ventas (tabla `ventas`) del mes que ESTÁN
@@ -885,7 +885,7 @@ app.get('/ventas-call/atribucion', async (req, res) => {
       WHERE ${cond.join(' AND ')}
       ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-call/atribucion:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-call/atribucion:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /ventas-call/:codigo — edita a mano los campos de atribución (AsesorVenta,
@@ -913,7 +913,7 @@ app.put('/ventas-call/:codigo', async (req, res) => {
       `UPDATE ventas SET ${sets.join(', ')} WHERE codigo_cv = $${vals.length}`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Venta no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /ventas-call/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /ventas-call/:codigo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // POST /ventas-call/consolidar?anio=&mes= — copia (merge/upsert por IDVenta) las ventas
@@ -967,7 +967,7 @@ app.post('/ventas-call/consolidar', async (req, res) => {
       RETURNING (xmax = 0) AS inserted`, params);
     let insertados = 0; for (const r of rows) if (r.inserted) insertados++;
     res.json({ success: true, total: rows.length, insertados, actualizados: rows.length - insertados });
-  } catch (e) { console.error('❌ POST /ventas-call/consolidar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /ventas-call/consolidar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1046,7 +1046,7 @@ app.post('/ventas-realzza/cruzar', async (req, res) => {
     const { rows: tot } = await pgPool.query(`
       SELECT COUNT(*)::int n FROM ventas_realzza v ${DERIV_LATERAL_RZ} ${totWhere}`, totParams);
     res.json({ success: true, actualizados: rows.length, total: tot[0].n });
-  } catch (e) { console.error('❌ POST /ventas-realzza/cruzar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /ventas-realzza/cruzar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-realzza/atribucion?anio=&mes= — TODAS las ventas Realzza del mes con su
@@ -1067,7 +1067,7 @@ app.get('/ventas-realzza/atribucion', async (req, res) => {
       WHERE ${cond.join(' AND ')} ${sedeTiendaSQL('v.sede', tienda)}
       ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-realzza/atribucion:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-realzza/atribucion:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-realzza/buscar?dni=&anio=&mes= — busca ese DNI en las ventas Realzza del mes.
@@ -1088,7 +1088,7 @@ app.get('/ventas-realzza/buscar', async (req, res) => {
       WHERE ${cond.join(' AND ')} ${sedeTiendaSQL('v.sede', tienda)}
       ORDER BY v.fecha_cv DESC NULLS LAST`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-realzza/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-realzza/buscar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-realzza/por-cc?cc=CC5 — TODAS las ventas Realzza (cualquier tienda, sin
@@ -1110,7 +1110,7 @@ app.get('/ventas-realzza/por-cc', async (req, res) => {
       WHERE ${cond.join(' AND ')}
       ORDER BY v.fecha_cv DESC NULLS LAST`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-realzza/por-cc:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-realzza/por-cc:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /ventas-realzza/:codigo — edita a mano TipoBase / AsesorVenta (protege del re-cruce).
@@ -1145,7 +1145,7 @@ app.put('/ventas-realzza/:codigo', async (req, res) => {
       `UPDATE ventas_realzza SET ${sets.join(', ')} WHERE codigo_cv = $${vals.length}`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Venta no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /ventas-realzza/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /ventas-realzza/:codigo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // POST /ventas-realzza/consolidar?anio=&mes= — agrega a `ventas_realzza` las ventas
@@ -1175,7 +1175,7 @@ app.post('/ventas-realzza/consolidar', async (req, res) => {
       ON CONFLICT (codigo_cv) DO NOTHING
       RETURNING codigo_cv`, params);
     res.json({ success: true, insertados: rows.length });
-  } catch (e) { console.error('❌ POST /ventas-realzza/consolidar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /ventas-realzza/consolidar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1238,7 +1238,7 @@ app.post('/ventas-sedes/cruzar', async (req, res) => {
       FROM deriv WHERE v.codigo_cv = deriv.codigo_cv
       RETURNING v.codigo_cv`, params);
     res.json({ success: true, actualizados: rows.length });
-  } catch (e) { console.error('❌ POST /ventas-sedes/cruzar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /ventas-sedes/cruzar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-sedes/atribucion?anio=&mes=&sede= — ventas de la sede con su fuente + derivado.
@@ -1259,7 +1259,7 @@ app.get('/ventas-sedes/atribucion', async (req, res) => {
       WHERE ${cond.join(' AND ')}
       ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-sedes/atribucion:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-sedes/atribucion:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-sedes/buscar?dni=&anio=&mes=&sede= — busca ese DNI en las ventas de la sede.
@@ -1280,7 +1280,7 @@ app.get('/ventas-sedes/buscar', async (req, res) => {
       WHERE ${cond.join(' AND ')}
       ORDER BY v.fecha_cv DESC NULLS LAST`, params);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-sedes/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-sedes/buscar:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // PUT /ventas-sedes/:codigo — edita a mano la fuente generadora (protege del re-cruce).
@@ -1296,7 +1296,7 @@ app.put('/ventas-sedes/:codigo', async (req, res) => {
       [parseInt(req.params.codigo, 10), fuente]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Venta no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /ventas-sedes/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /ventas-sedes/:codigo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1458,7 +1458,7 @@ app.get('/ventas-sedes/sueldo', async (req, res) => {
       remTotal: r2(remTotal),
       nota: 'Estimado a mes completo, neto de NC/Incautaciones. Bono Volumen requiere que la sede llegue al 100% de su meta.',
     });
-  } catch (e) { console.error('❌ GET /ventas-sedes/sueldo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-sedes/sueldo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1488,7 +1488,7 @@ app.get('/meta-sede', async (req, res) => {
       });
     }
     res.json(out);
-  } catch (e) { console.error('❌ GET /meta-sede:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /meta-sede:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // POST /meta-sede — upsert de la meta de una sede/mes. Body: { sede, anio, mes, meta }.
@@ -1506,7 +1506,7 @@ app.post('/meta-sede', async (req, res) => {
        ON CONFLICT (UPPER(sede), anio, mes) DO UPDATE SET meta = EXCLUDED.meta, updated_at = now()`,
       [sede, anio, mes, meta]);
     res.json({ success: true });
-  } catch (e) { console.error('❌ POST /meta-sede:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /meta-sede:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // DELETE /meta-sede/:id — borra la meta (la sede vuelve a quedar sin meta).
@@ -1517,7 +1517,7 @@ app.delete('/meta-sede/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM meta_sede WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Meta no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /meta-sede/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /meta-sede/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1568,7 +1568,7 @@ app.get('/meta-tipo-base', async (req, res) => {
       return { id: m?.id || null, tipo_base: t.tipo_base, anio, mes, meta: m ? +m.meta : 0 };
     });
     res.json(out);
-  } catch (e) { console.error('❌ GET /meta-tipo-base:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /meta-tipo-base:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // POST /meta-tipo-base — upsert. Body: { tipo_base, anio, mes, meta }.
@@ -1586,7 +1586,7 @@ app.post('/meta-tipo-base', async (req, res) => {
        ON CONFLICT (UPPER(tipo_base), anio, mes) DO UPDATE SET meta = EXCLUDED.meta, updated_at = now()`,
       [tipo, anio, mes, meta]);
     res.json({ success: true });
-  } catch (e) { console.error('❌ POST /meta-tipo-base:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ POST /meta-tipo-base:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // DELETE /meta-tipo-base/:id — borra la meta.
@@ -1597,7 +1597,7 @@ app.delete('/meta-tipo-base/:id', async (req, res) => {
     const { rowCount } = await pgPool.query('DELETE FROM meta_tipo_base WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Meta no encontrada.' });
     res.json({ success: true });
-  } catch (e) { console.error('❌ DELETE /meta-tipo-base/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ DELETE /meta-tipo-base/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-realzza/modulo?anio= — data del MÓDULO Ventas Realzza: UNA fila por venta,
@@ -1654,7 +1654,7 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
       LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
       WHERE v.sede ILIKE '%REALZZA%' AND (v.anio_cv = $2 OR v.anio_af = $2)`, [DERIV_MOTIVOS, anio, DERIV_MOTIVOS_RZ])).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Tienda Realzza por etiqueta de sede de la venta: 'SEDE RETAIL REALZZA PIURA' / 'LIMA';
@@ -1753,7 +1753,7 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
       ORDER BY k.anio, k.mes, k.grupo`,
       [DERIV_MOTIVOS, anioDesde, mesDesde, anioHasta, mesHasta, DERIV_MOTIVOS_RZ])).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-realzza/motos-fuente:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-realzza/motos-fuente:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /ventas-realzza/evolutivo — neto REAL mensual para el gráfico evolutivo.
@@ -1807,7 +1807,7 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
       WHERE m.anio > 0 AND m.mes > 0
       ORDER BY m.anio, m.mes`);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /ventas-realzza/evolutivo:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-realzza/evolutivo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2157,7 +2157,7 @@ function registrarLeads(canal, ruta) {
       res.json({ success: true, filas: rows.length, insertados, actualizados, incremental: !!desdeUnix, updated_at: new Date().toISOString() });
     } catch (error) {
       console.error(`❌ Error en POST /${ruta}/sync-kommo:`, error);
-      res.status(500).json({ success: false, message: error.message || 'No se pudo sincronizar con Kommo.' });
+      res.status(500).json({ success: false, message: 'Error interno del servidor.' || 'No se pudo sincronizar con Kommo.' });
     }
   });
   // GET /{ruta}/listado?anio=&mes=&tienda= — listado de leads (ID, nombre del
@@ -2505,7 +2505,7 @@ app.get('/productos', async (req, res) => {
     const q = String(req.query.q || '').trim().toLowerCase();
     const out = (q ? all.filter(p => p.toLowerCase().includes(q)) : all).slice(0, 50);
     res.json(out);
-  } catch (e) { console.error('❌ GET /productos:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /productos:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2564,7 +2564,7 @@ app.get('/avance-sedes', async (req, res) => {
       WHERE COALESCE(k.sede,'') <> ''
       ORDER BY k.sede, k.es_moto, k.clase`, [anio, mes])).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /avance-sedes:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /avance-sedes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /avance-vendedor?anio=&mes= → neto por (sede, vendedor, clase PROPIO/ALIADO), con el
@@ -2601,7 +2601,7 @@ app.get('/avance-vendedor', async (req, res) => {
       WHERE COALESCE(k.sede,'') <> '' AND COALESCE(k.vendedor,'') <> ''
       ORDER BY k.sede, k.vendedor`, [anio, mes])).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /avance-vendedor:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /avance-vendedor:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2655,7 +2655,7 @@ app.get('/reporte-global', async (req, res) => {
       WHERE COALESCE(k.sede,'') <> ''
       ORDER BY k.sede, k.entidad`, [anio, mes, dia])).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /reporte-global-detalle?anio=&mes=&dia=&sede=sede1,sede2&entidad= → detalle de las
@@ -2686,7 +2686,7 @@ app.get('/reporte-global-detalle', async (req, res) => {
       ORDER BY anio_cv DESC, mes_cv DESC, dia_cv DESC, monto_consolidado DESC`,
       [anio, mes, dia, sedes, entidad]);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /reporte-global-detalle:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /reporte-global-detalle:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /reporte-global-motos?anio=&mes= → motos a nivel detalle por (sede, credito, marca,
@@ -2744,7 +2744,7 @@ app.get('/reporte-global-motos', async (req, res) => {
       WHERE motos > 0 OR motos_bruto > 0
       ORDER BY sede, motos_bruto DESC`, [anio, mes, dia])).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /margen-linea-sede?anio=&mes= → ventas/margen por (sede, línea real), desde margen_ventas.
@@ -2769,7 +2769,7 @@ app.get('/margen-linea-sede', async (req, res) => {
          FROM margen_ventas ${where}
          GROUP BY 1, 2 ORDER BY 1, 3 DESC`, params)).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /margen-linea-sede:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /margen-linea-sede:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // GET /margen-producto?anio=&mes= → ventas por (tipo_producto, marca, sede), desde
@@ -2804,7 +2804,7 @@ app.get('/margen-producto', async (req, res) => {
          ${where}
          GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`, params)).rows);
     res.json(rows);
-  } catch (e) { console.error('❌ GET /margen-producto:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /margen-producto:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2949,7 +2949,7 @@ app.get('/ventas-linea-asesor', async (req, res) => {
       if (!ultima || finMes > ultima) mesesProyeccion.push(`${a}-${String(m).padStart(2, '0')}`);
     }
     res.json({ rows, mesesProyeccion });
-  } catch (e) { console.error('❌ GET /ventas-linea-asesor:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /ventas-linea-asesor:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // Metas editables por sede (cuadros General y Motos del módulo Avance de Metas).
@@ -2975,7 +2975,7 @@ app.get('/metas-avance', async (req, res) => {
     const { rows } = await pgPool.query('SELECT clave, meta FROM metas_avance_sede');
     const map = {}; rows.forEach(r => { map[r.clave] = Number(r.meta); });
     res.json(map);
-  } catch (e) { console.error('❌ GET /metas-avance:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ GET /metas-avance:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 // PUT /metas-avance { clave, meta } → upsert (edición en la propia tabla del módulo).
 app.put('/metas-avance', async (req, res) => {
@@ -2989,7 +2989,7 @@ app.put('/metas-avance', async (req, res) => {
       `INSERT INTO metas_avance_sede (clave, meta) VALUES ($1, $2)
        ON CONFLICT (clave) DO UPDATE SET meta = EXCLUDED.meta, actualizado_en = now()`, [clave, meta]);
     res.json({ success: true });
-  } catch (e) { console.error('❌ PUT /metas-avance:', e); res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { console.error('❌ PUT /metas-avance:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── Health ───────────────────────────────────────────────────────────────────
