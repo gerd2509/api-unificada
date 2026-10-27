@@ -272,6 +272,27 @@ app.post('/auth/login', async (req, res) => {
     if (!ok) {
       return res.status(401).json({ success: false, message: 'Credenciales inválidas o usuario inactivo.' });
     }
+    // El CAP es la fuente única de "¿sigue siendo vendedor activo?": si su DNI (o su
+    // nombre, cuando el DNI no calza) figura en el CAP con estado RENUNCIA, se bloquea
+    // el login aunque su cuenta de Seguridad siga marcada como activa — así una sola
+    // baja en el Maestro CAP alcanza, sin tener que recordar desactivarlo también ahí.
+    try {
+      await ensureCapSchema();
+      const dniCandidatos = [u.dni, u.usuario].filter(Boolean).map(v => v.toString().trim()).filter(Boolean);
+      const { rows: capRows } = await pgPool.query(
+        `SELECT estado FROM cap_asesores
+         WHERE (TRIM(dni) = ANY($1::text[]) AND TRIM(COALESCE(dni,'')) <> '')
+            OR (TRIM(COALESCE($2,'')) <> '' AND UPPER(TRIM(vendedor)) = UPPER(TRIM($2)))
+         ORDER BY (TRIM(dni) = ANY($1::text[])) DESC
+         LIMIT 1`,
+        [dniCandidatos, u.vendedor || '']
+      );
+      if (capRows[0]?.estado === 'RENUNCIA') {
+        return res.status(401).json({ success: false, message: 'Tu usuario fue dado de baja en el CAP. Contacta a tu supervisor.' });
+      }
+    } catch (e) {
+      console.error('⚠️ No se pudo verificar el estado en el CAP (se deja pasar el login):', e.message);
+    }
     res.json({
       success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '',
       // Sedes asignadas (varias). Si no hay lista, cae a [sede] para compatibilidad.
