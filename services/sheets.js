@@ -627,6 +627,10 @@ app.post('/usuarios/bulk-cap', async (req, res) => {
     if (!sedeKey) return res.status(400).json({ success: false, message: 'Falta la sede.' });
     // Permisos: si viene un array `modulos`, se asigna EXPLÍCITO a todos; si no, NULL = default rol-perfil.
     const modulos = Array.isArray(body.modulos) ? JSON.stringify(body.modulos.filter(Boolean)) : null;
+    // Realzza (Chiclayo/Piura/Lima) es un canal propio — canal='sede' (piso) los haría
+    // invisibles para canalDeUsuario() salvo por el fallback de texto; con 'realzza' el
+    // canal queda explícito y correcto desde el alta.
+    const canal = sedeKey.startsWith('realzza') ? 'realzza' : 'sede';
     const filas = await capAsesoresDeSede(sedeKey);
     const creados = [], omitidos = [];
     for (const f of filas) {
@@ -636,9 +640,9 @@ app.post('/usuarios/bulk-cap', async (req, res) => {
         const hash = await bcrypt.hash(dni, 10);
         const { rowCount } = await pgPool.query(
           `INSERT INTO usuarios (usuario, password_hash, nombre, rol, sede, vendedor, canal, modulos, sedes, activo, dni, debe_cambiar_password)
-           VALUES ($1,$2,$3,'vendedor',$4,$5,'sede',$8::jsonb,$6::jsonb,true,$7,true)
+           VALUES ($1,$2,$3,'vendedor',$4,$5,$8,$9::jsonb,$6::jsonb,true,$7,true)
            ON CONFLICT (usuario) DO NOTHING`,
-          [dni, hash, f.vendedor, sedeKey, f.vendedor, JSON.stringify([sedeKey]), dni, modulos]
+          [dni, hash, f.vendedor, sedeKey, f.vendedor, JSON.stringify([sedeKey]), dni, canal, modulos]
         );
         if (rowCount > 0) creados.push({ vendedor: f.vendedor, dni, usuario: dni });
         else omitidos.push({ vendedor: f.vendedor, dni, motivo: 'ya existe' });
