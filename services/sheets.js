@@ -1285,6 +1285,11 @@ async function ensureCapMaestros() {
       creado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
       actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- Ubicación de la tienda (Registro de Asistencia): coordenadas + radio
+    -- aceptado en metros. NULL = sin configurar (esa sede no pide ubicación).
+    ALTER TABLE cap_sedes ADD COLUMN IF NOT EXISTS latitud  DOUBLE PRECISION;
+    ALTER TABLE cap_sedes ADD COLUMN IF NOT EXISTS longitud DOUBLE PRECISION;
+    ALTER TABLE cap_sedes ADD COLUMN IF NOT EXISTS radio_metros INTEGER NOT NULL DEFAULT 150;
     CREATE TABLE IF NOT EXISTS cap_supervisores (
       id BIGSERIAL PRIMARY KEY,
       nombre TEXT NOT NULL,
@@ -1431,7 +1436,7 @@ app.get('/cap/sedes', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureCapMaestros(); res.set('Cache-Control', 'no-store');
-    const { rows } = await pgPool.query(`SELECT id, nombre, gerente, zona FROM cap_sedes ORDER BY nombre`);
+    const { rows } = await pgPool.query(`SELECT id, nombre, gerente, zona, latitud, longitud, radio_metros FROM cap_sedes ORDER BY nombre`);
     res.json(rows);
   } catch (e) { console.error('❌ GET /cap/sedes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
@@ -1442,11 +1447,15 @@ app.post('/cap/sedes', async (req, res) => {
     const b = req.body || {};
     const nombre = String(b.nombre ?? '').trim();
     if (!nombre) return res.status(400).json({ success: false, message: 'El nombre de la sede es obligatorio.' });
+    const lat = b.latitud !== undefined && b.latitud !== null && b.latitud !== '' ? Number(b.latitud) : null;
+    const lng = b.longitud !== undefined && b.longitud !== null && b.longitud !== '' ? Number(b.longitud) : null;
+    const radio = b.radio_metros !== undefined && b.radio_metros !== null && b.radio_metros !== '' ? parseInt(b.radio_metros, 10) : 150;
     const { rows } = await pgPool.query(
-      `INSERT INTO cap_sedes (nombre, gerente, zona) VALUES ($1,$2,$3)
-       ON CONFLICT (nombre) DO UPDATE SET gerente=EXCLUDED.gerente, zona=EXCLUDED.zona, actualizado_en=now()
+      `INSERT INTO cap_sedes (nombre, gerente, zona, latitud, longitud, radio_metros) VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (nombre) DO UPDATE SET gerente=EXCLUDED.gerente, zona=EXCLUDED.zona,
+         latitud=EXCLUDED.latitud, longitud=EXCLUDED.longitud, radio_metros=EXCLUDED.radio_metros, actualizado_en=now()
        RETURNING id`,
-      [nombre, String(b.gerente ?? '').trim(), String(b.zona ?? '').trim().toUpperCase()]);
+      [nombre, String(b.gerente ?? '').trim(), String(b.zona ?? '').trim().toUpperCase(), lat, lng, radio]);
     res.json({ success: true, id: rows[0].id });
   } catch (e) { console.error('❌ POST /cap/sedes:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
@@ -1460,6 +1469,9 @@ app.put('/cap/sedes/:id', async (req, res) => {
     if (b.nombre  !== undefined) add('nombre', b.nombre);
     if (b.gerente !== undefined) add('gerente', b.gerente);
     if (b.zona    !== undefined) add('zona', b.zona, true);
+    if (b.latitud !== undefined) { vals.push(b.latitud === null || b.latitud === '' ? null : Number(b.latitud)); sets.push(`latitud = $${vals.length}`); }
+    if (b.longitud !== undefined) { vals.push(b.longitud === null || b.longitud === '' ? null : Number(b.longitud)); sets.push(`longitud = $${vals.length}`); }
+    if (b.radio_metros !== undefined) { vals.push(b.radio_metros === null || b.radio_metros === '' ? 150 : parseInt(b.radio_metros, 10)); sets.push(`radio_metros = $${vals.length}`); }
     if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
     sets.push('actualizado_en = now()'); vals.push(parseInt(req.params.id, 10));
     const { rowCount } = await pgPool.query(`UPDATE cap_sedes SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
@@ -1475,6 +1487,105 @@ app.delete('/cap/sedes/:id', async (req, res) => {
     if (!rowCount) return res.status(404).json({ success: false, message: 'Sede no encontrada.' });
     res.json({ success: true });
   } catch (e) { console.error('❌ DELETE /cap/sedes/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 📍 Registro de Asistencia (piloto): marca de ubicación al momento de marcar
+// asistencia, comparada contra la ubicación configurada de la sede del usuario
+// (cap_sedes.latitud/longitud/radio_metros). NO bloquea nada — siempre se
+// guarda, y si quedó fuera del radio se marca `dentro_rango: false` para que
+// el admin lo revise en la lista; el GPS del navegador no es confiable al
+// 100% (sobre todo en PC/laptop) como para usarlo de candado duro.
+// ═════════════════════════════════════════════════════════════════════════════
+let asistenciaSchemaLista = false;
+async function ensureAsistenciaSchema() {
+  if (!pgPool || asistenciaSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS asistencia (
+      id BIGSERIAL PRIMARY KEY,
+      usuario TEXT NOT NULL,
+      nombre TEXT,
+      sede TEXT,
+      latitud DOUBLE PRECISION NOT NULL,
+      longitud DOUBLE PRECISION NOT NULL,
+      precision_metros DOUBLE PRECISION,
+      distancia_metros DOUBLE PRECISION,
+      dentro_rango BOOLEAN,
+      creado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_asistencia_usuario ON asistencia (usuario);
+    CREATE INDEX IF NOT EXISTS ix_asistencia_creado  ON asistencia (creado_en);
+  `);
+  asistenciaSchemaLista = true;
+}
+// Distancia entre 2 puntos (fórmula de Haversine), en metros.
+function distanciaMetros(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = d => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// POST /asistencia — el propio usuario marca su asistencia (usuario/nombre/sede
+// salen del token, no del body: no se puede marcar asistencia "a nombre de otro").
+app.post('/asistencia', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAsistenciaSchema(); await ensureCapMaestros();
+    const b = req.body || {};
+    const lat = Number(b.latitud), lng = Number(b.longitud);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ success: false, message: 'No se pudo leer tu ubicación.' });
+    }
+    const precision = Number.isFinite(Number(b.precision)) ? Number(b.precision) : null;
+    const u = req.usuario || {};
+    const sedeKey = (u.sede || '').toString().trim().toLowerCase();
+
+    const { rows: sedeRows } = await pgPool.query(
+      `SELECT nombre, latitud, longitud, radio_metros FROM cap_sedes
+       WHERE regexp_replace(lower(translate(nombre,'ñÑ','nn')),'[^a-z0-9]','','g') = $1`,
+      [sedeKey]
+    );
+    const sedeInfo = sedeRows[0] || null;
+    const sedeNombre = sedeInfo?.nombre || u.sede || '';
+
+    let dist = null, dentroRango = null;
+    const sinUbicacionConfigurada = !sedeInfo || sedeInfo.latitud == null || sedeInfo.longitud == null;
+    if (!sinUbicacionConfigurada) {
+      dist = distanciaMetros(lat, lng, sedeInfo.latitud, sedeInfo.longitud);
+      dentroRango = dist <= (sedeInfo.radio_metros || 150);
+    }
+
+    const { rows } = await pgPool.query(
+      `INSERT INTO asistencia (usuario, nombre, sede, latitud, longitud, precision_metros, distancia_metros, dentro_rango)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, creado_en`,
+      [u.usuario || '', u.nombre || '', sedeNombre, lat, lng, precision, dist, dentroRango]
+    );
+    res.json({
+      success: true, id: rows[0].id, creadoEn: rows[0].creado_en, sede: sedeNombre,
+      distanciaMetros: dist != null ? Math.round(dist) : null,
+      dentroRango, sinUbicacionConfigurada,
+    });
+  } catch (e) { console.error('❌ POST /asistencia:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// GET /asistencia?desde=&hasta= — listado para revisión (admin).
+app.get('/asistencia', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAsistenciaSchema();
+    const desde = req.query.desde ? String(req.query.desde) : null;
+    const hasta = req.query.hasta ? String(req.query.hasta) : null;
+    const where = [], params = [];
+    if (desde) { params.push(desde); where.push(`creado_en >= $${params.length}::date`); }
+    if (hasta) { params.push(hasta); where.push(`creado_en < ($${params.length}::date + INTERVAL '1 day')`); }
+    const { rows } = await pgPool.query(
+      `SELECT id, usuario, nombre, sede, latitud, longitud, precision_metros, distancia_metros, dentro_rango, creado_en
+       FROM asistencia ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY creado_en DESC LIMIT 1000`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /asistencia:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
 // ── Maestro de SUPERVISORES (cap_supervisores) por sede ────────────────────────
