@@ -10,7 +10,7 @@ require('dotenv').config();
 const express = require('express');
 const compression = require('compression');
 const { Pool } = require('pg');
-const { aplicarSeguridad } = require('./_security');
+const { aplicarSeguridad, crearRequireAuth, firmarTokenServicio } = require('./_security');
 
 const app = express();
 const PORT = process.env.PORT || 4004;
@@ -19,6 +19,12 @@ app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos by
 aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 // Límite alto: el control del supervisor trae fotos en base64.
 app.use(express.json({ limit: '20mb' }));
+app.use(crearRequireAuth());   // todas las rutas de este servicio exigen sesión
+
+// Token de SERVICIO para las llamadas internas a sheets.js (GET /data/sedes,
+// /data/ferre) — no son llamadas de un usuario, pero sheets.js igual exige un
+// JWT válido en todas sus rutas salvo login.
+const TOKEN_SERVICIO = firmarTokenServicio();
 
 const pgPool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
@@ -275,7 +281,7 @@ app.post('/gestion/sync-sedes', async (req, res) => {
     if (desde) qs.push(`desde=${encodeURIComponent(desde)}`);
     if (hasta) qs.push(`hasta=${encodeURIComponent(hasta)}`);
     const url = `${SHEETS_API_URL}/data/sedes${qs.length ? '?' + qs.join('&') : ''}`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(120000) });
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN_SERVICIO}` }, signal: AbortSignal.timeout(120000) });
     if (!resp.ok) throw new Error(`sheets-api /data/sedes -> ${resp.status}`);
     const data = await resp.json();
     const filas = (Array.isArray(data) ? data : [])
@@ -484,7 +490,7 @@ app.post('/call-sedes/sync', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureCallSedesSchema();
-    const resp = await fetch(`${SHEETS_API_URL}/data/ferre`, { signal: AbortSignal.timeout(120000) });
+    const resp = await fetch(`${SHEETS_API_URL}/data/ferre`, { headers: { Authorization: `Bearer ${TOKEN_SERVICIO}` }, signal: AbortSignal.timeout(120000) });
     if (!resp.ok) throw new Error(`sheets-api /data/ferre -> ${resp.status}`);
     const data = await resp.json();
     const filas = (Array.isArray(data) ? data : []).map(mapCallSedeSheet).filter(f => f.dni_cliente || f.asesor);

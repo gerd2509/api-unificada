@@ -17,7 +17,7 @@ const compression = require('compression');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const { Pool } = require('pg');
-const { aplicarSeguridad } = require('./_security');
+const { aplicarSeguridad, crearRequireAuth } = require('./_security');
 
 const app = express();
 const PORT = process.env.PORT || 4003;
@@ -25,6 +25,7 @@ const PORT = process.env.PORT || 4003;
 app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos bytes)
 aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 app.use(express.json({ limit: '20mb' }));
+app.use(crearRequireAuth());   // todas las rutas de este servicio exigen sesión
 
 // 🐘 PostgreSQL (Neon) — misma cadena que el monolito (variable DATABASE_URL).
 const pgPool = process.env.DATABASE_URL

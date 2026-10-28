@@ -18,6 +18,7 @@
     "express-rate-limit": "^8.7.1",
     "googleapis": "^149.0.0",
     "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3",
     "multer": "^2.2.0",
     "pg": "^8.13.1",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"

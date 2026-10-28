@@ -7,7 +7,7 @@ const multer = require('multer');
 const XLSX = require('xlsx');
 const bcrypt = require('bcryptjs');
 
-const { aplicarSeguridad, limiteLogin } = require('./_security');
+const { aplicarSeguridad, limiteLogin, firmarToken, crearRequireAuth } = require('./_security');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,6 +16,13 @@ app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos by
 aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 // Límite alto porque el control del supervisor puede traer fotos en base64.
 app.use(express.json({ limit: '20mb' }));
+// Únicas rutas públicas de este servicio: login, branding pre-login y cambio de
+// clave (esta última valida la clave ACTUAL adentro, no necesita token aparte).
+app.use(crearRequireAuth([
+  { metodo: 'POST', ruta: '/auth/login' },
+  { metodo: 'GET',  ruta: '/auth/marca' },
+  { metodo: 'POST', ruta: '/auth/cambiar-password' },
+]));
 
 // 🐘 PostgreSQL (Neon) — para el formulario de registro de gestión.
 // La cadena vive en la variable de entorno DATABASE_URL (nunca en el código).
@@ -294,12 +301,18 @@ app.post('/auth/login', limiteLogin, async (req, res) => {
     } catch (e) {
       console.error('⚠️ No se pudo verificar el estado en el CAP (se deja pasar el login):', e.message);
     }
+    const sedes = Array.isArray(u.sedes) && u.sedes.length ? u.sedes : (u.sede ? [u.sede] : []);
+    const modulos = Array.isArray(u.modulos) ? u.modulos : null;   // null = usa default por rol-perfil
+    const token = firmarToken({
+      usuario: u.usuario, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '',
+      sedes, vendedor: u.vendedor || '', canal: u.canal || '', modulos,
+    });
     res.json({
-      success: true, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '',
+      success: true, token, nombre: u.nombre || '', rol: u.rol || '', sede: u.sede || '',
       // Sedes asignadas (varias). Si no hay lista, cae a [sede] para compatibilidad.
-      sedes: Array.isArray(u.sedes) && u.sedes.length ? u.sedes : (u.sede ? [u.sede] : []),
+      sedes,
       vendedor: u.vendedor || '', canal: u.canal || '', vehiculo: u.vehiculo || '',
-      modulos: Array.isArray(u.modulos) ? u.modulos : null,   // null = usa default por rol-perfil
+      modulos,   // null = usa default por rol-perfil
       debeCambiarPassword: !!u.debe_cambiar_password,          // forzar cambio en el 1er login
     });
   } catch (error) {

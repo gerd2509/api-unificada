@@ -7,6 +7,16 @@
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
+
+// Firma los tokens de sesión (JWT) y los de servicio (llamadas internas entre
+// microservicios). OBLIGATORIO en producción — sin esto el servidor no arranca,
+// a propósito: mejor que falle al desplegar a que corra "autenticando" con un
+// secreto vacío/adivinable.
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('Falta JWT_SECRET en las variables de entorno — es obligatorio para firmar/validar sesiones.');
+}
 
 // ALLOWED_ORIGINS en el .env: lista separada por comas, sin espacios, p.ej.
 //   ALLOWED_ORIGINS=https://dashboard-leoncito.onrender.com
@@ -66,4 +76,51 @@ function aplicarSeguridad(app) {
   app.use(limiteGeneral);
 }
 
-module.exports = { aplicarSeguridad, limiteLogin };
+// ─────────────────────────────────────────────────────────────────────────────
+// Autenticación (JWT): el login firma un token con la identidad del usuario;
+// cada ruta (salvo las explícitamente públicas) lo exige en el header
+// `Authorization: Bearer <token>` y lo deja en `req.usuario`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Firma el token de sesión de un usuario logueado. 12h = una jornada; después
+ *  tiene que volver a loguearse (igual que el cierre por inactividad del front,
+ *  pero validado del lado del servidor, no solo de palabra). */
+function firmarToken(usuario) {
+  const payload = {
+    usuario: usuario.usuario, nombre: usuario.nombre, rol: usuario.rol,
+    sede: usuario.sede, sedes: usuario.sedes, vendedor: usuario.vendedor,
+    canal: usuario.canal, modulos: usuario.modulos,
+  };
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
+}
+
+/** Token de SERVICIO (no de un usuario) para las llamadas internas entre
+ *  microservicios (p.ej. gestion.js → GET /sheets/data/sedes). Larga duración:
+ *  es interno, no lo ve ningún navegador, y rotarlo requiere redeploy de ambos
+ *  lados a la vez. */
+function firmarTokenServicio() {
+  return jwt.sign({ servicio: true }, JWT_SECRET, { expiresIn: '3650d' });
+}
+
+/** Crea el middleware que exige el token en cada request, salvo las rutas
+ *  públicas que se le pasen (método + path EXACTOS, relativos al mount point:
+ *  dentro de sheets.js un POST a /sheets/auth/login llega como '/auth/login'). */
+function crearRequireAuth(rutasPublicas = []) {
+  return function requireAuth(req, res, next) {
+    const esPublica = rutasPublicas.some(r => r.metodo === req.method && r.ruta === req.path);
+    if (esPublica) return next();
+
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+    if (!token) return res.status(401).json({ success: false, message: 'No autenticado.' });
+
+    try {
+      req.usuario = jwt.verify(token, JWT_SECRET);
+      next();
+    } catch (e) {
+      res.status(401).json({ success: false, message: 'Sesión inválida o expirada. Vuelve a iniciar sesión.' });
+    }
+  };
+}
+
+module.exports = { aplicarSeguridad, limiteLogin, firmarToken, firmarTokenServicio, crearRequireAuth };

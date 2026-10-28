@@ -11,7 +11,7 @@ const express = require('express');
 const compression = require('compression');
 const multer = require('multer');
 const { Pool } = require('pg');
-const { aplicarSeguridad } = require('./_security');
+const { aplicarSeguridad, crearRequireAuth } = require('./_security');
 
 const app = express();
 const PORT = process.env.PORT || 4005;
@@ -19,6 +19,7 @@ const PORT = process.env.PORT || 4005;
 app.use(compression());
 aplicarSeguridad(app);    // trust proxy + helmet + CORS restringido + rate limit general
 app.use(express.json({ limit: '2mb' }));
+app.use(crearRequireAuth());   // todas las rutas de este servicio exigen sesión
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 * 1024 * 1024 } });
 
