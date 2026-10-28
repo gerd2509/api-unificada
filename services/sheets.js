@@ -1577,9 +1577,13 @@ app.get('/asistencia', async (req, res) => {
     await ensureAsistenciaSchema();
     const desde = req.query.desde ? String(req.query.desde) : null;
     const hasta = req.query.hasta ? String(req.query.hasta) : null;
+    // Comparar convirtiendo a hora de Lima: creado_en se guarda en UTC (timestamptz
+    // correcto), pero el "día" que el usuario elige en el date-picker es un día
+    // calendario de Lima — comparando en UTC crudo, una marca de la noche en Lima
+    // cae en el día SIGUIENTE en UTC y desaparecía del filtro de "hoy".
     const where = [], params = [];
-    if (desde) { params.push(desde); where.push(`creado_en >= $${params.length}::date`); }
-    if (hasta) { params.push(hasta); where.push(`creado_en < ($${params.length}::date + INTERVAL '1 day')`); }
+    if (desde) { params.push(desde); where.push(`(creado_en AT TIME ZONE 'America/Lima') >= $${params.length}::date`); }
+    if (hasta) { params.push(hasta); where.push(`(creado_en AT TIME ZONE 'America/Lima') < ($${params.length}::date + INTERVAL '1 day')`); }
     const { rows } = await pgPool.query(
       `SELECT id, usuario, nombre, sede, latitud, longitud, precision_metros, distancia_metros, dentro_rango, creado_en
        FROM asistencia ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
