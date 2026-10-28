@@ -1682,6 +1682,7 @@ function sedeTiendaSQL(col, tienda) {
 //   fallback a 'CALL' por derivación Call, y si tampoco hay CALL, a la derivación
 //   Realzza vía gestion_realzza — misma que ve la Atribución de Ventas).
 app.get('/ventas-realzza/motos-fuente', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribRealzza();
@@ -1763,6 +1764,7 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
 // el mes de la venta — igual criterio que /reporte-global). Se acota a los meses que ya
 // tienen ventas en ventas_realzza (evita meses viejos con solo-NC en negativo).
 app.get('/ventas-realzza/evolutivo', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribRealzza();
@@ -2455,6 +2457,7 @@ app.get('/margen-ventas/estado', async (req, res) => {
 });
 
 app.get('/margen-ventas', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureMargenSchema();
