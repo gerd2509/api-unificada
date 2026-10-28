@@ -47,11 +47,17 @@ const limiteGeneral = rateLimit({
   message: { success: false, message: 'Demasiadas solicitudes. Intenta de nuevo en unos minutos.' },
 });
 
-/** Límite estricto para el login: frena fuerza bruta de contraseñas (15 intentos
- *  cada 15 min por IP). Se aplica SOLO a /auth/login, no a todo el servicio. */
+/** Límite para el login: frena fuerza bruta de contraseñas sin bloquear el uso
+ *  real. OJO: muchas personas de la MISMA tienda/oficina comparten una sola IP
+ *  pública (NAT) — con 15/15min, dos o tres personas probando usuario/clave en
+ *  la misma ventana (o alguien reintentando) ya tumbaba el login para TODOS los
+ *  que están detrás de esa IP. 60 sigue siendo demasiado bajo para que un
+ *  ataque de fuerza bruta real llegue a algo contra bcrypt, pero no golpea el
+ *  uso normal de varias personas a la vez. Se aplica SOLO a /auth/login y
+ *  /auth/cambiar-password, no a todo el servicio. */
 const limiteLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 15,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Demasiados intentos de inicio de sesión. Espera unos minutos.' },
@@ -60,10 +66,15 @@ const limiteLogin = rateLimit({
 /** Aplica trust proxy + helmet + CORS + límite general. Llamar justo después de
  *  crear la app, ANTES de express.json() y de las rutas. */
 function aplicarSeguridad(app) {
-  // Render (y la mayoría de hostings) ponen la app detrás de un proxy — sin esto,
-  // req.ip siempre da la IP del proxy, no la del cliente real, y el rate limit por
-  // IP terminaría limitando (o no limitando) a todo el mundo junto.
-  app.set('trust proxy', 1);
+  // Render sirve *.onrender.com detrás de Cloudflare — la cadena real es
+  // cliente → Cloudflare → proxy de Render → esta app, 2 saltos antes de
+  // llegar acá. Con trust proxy=1 (un solo salto) el req.ip resuelto era el
+  // del proxy interno de Render, NO el del cliente — y como ese proxy es el
+  // MISMO para toda la app, todo el tráfico terminaba compartiendo un único
+  // cupo de rate limit (el incidente real: alguien probando varias cuentas
+  // agotó el límite de login para cualquiera que entrara después). Con 2 se
+  // resuelve la IP real del cliente, uno por persona.
+  app.set('trust proxy', 2);
   app.use(helmet({
     contentSecurityPolicy: false,   // API JSON pura, sin CSP (eso lo maneja el front)
     // El front vive en OTRO origen (Render del backend ≠ Render del front) — el
