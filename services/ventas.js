@@ -2607,20 +2607,19 @@ app.get('/avance-vendedor', async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 🌎 REPORTE GLOBAL (módulo "Reporte Global") — consolidado por sede.
-// GET /reporte-global?anio=&mes= → monto + # operaciones por (sede, entidad, es_moto),
-//   SOLO de ventas con fecha de venta (anio_cv/mes_cv/dia_cv) dentro del periodo pedido.
+// GET /reporte-global?anio=&mes= → monto + # operaciones por (sede, entidad, es_moto).
 //   entidad = tal cual (LEONCITO / GLOBAL GO / BRILLA / EFECTIVA); el front separa
 //             aliados (≠LEONCITO) y motos (es_moto) propio(LEONCITO)/GLOBAL GO.
-//   Cada mes muestra el número real con el que cerró ESE mes: una nota de crédito o
-//   incautación de una venta de OTRO mes, aunque se procese dentro del periodo pedido,
-//   NO resta acá — eso le corresponde al mes de la venta original (si para ese momento
-//   ya estaba cancelada, simplemente no cuenta como venta vigente de ese mes; si se
-//   cancela después, el mes de la venta ya cerró con su número real y no se toca).
-//   neto/ops y monto_bruto/ops_bruto quedan iguales (antes neto restaba notas de
-//   crédito/incautaciones de OTRO mes procesadas en el periodo — eso desalineaba la
-//   celda con su propio popup de detalle, que siempre fue bruto-del-periodo).
+//   El mes de la VENTA (anio_cv/mes_cv/dia_cv) queda SIEMPRE fijo con su número real,
+//   así se le aplique una nota de crédito/incautación después — ese mes ya cerró y no
+//   se recalcula. La nota de crédito/incautación resta en SU PROPIO mes de afectación
+//   (anio_af/mes_af/dia_af), sea el mismo mes de la venta (neteando a 0 ese mes) u otro
+//   mes posterior (ahí resta sola, sin "borrar" la venta original de su mes).
+//   monto_bruto/ops_bruto = solo la parte de ventas (sin restar notas de crédito/
+//   incautaciones), para cuadrar con el popup de detalle y con "Ventas Campo".
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/reporte-global', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
@@ -2632,20 +2631,27 @@ app.get('/reporte-global', async (req, res) => {
         SELECT sede,
           NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') AS entidad,
           (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto,
-          estado_venta, monto_consolidado, anio_cv, mes_cv, dia_cv
+          estado_venta, monto_consolidado, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af
         FROM ventas
-      )
-      SELECT sede, entidad, es_moto,
-        ROUND(SUM(monto_consolidado))::int AS neto,
-        COUNT(*)::int AS ops,
-        ROUND(SUM(monto_consolidado))::int AS monto_bruto,
-        COUNT(*)::int AS ops_bruto
-      FROM ent
-      WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-        AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-        AND COALESCE(sede,'') <> ''
-      GROUP BY sede, entidad, es_moto
-      ORDER BY sede, entidad`, [anio, mes, dia])).rows);
+      ),
+      ven AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
+        WHERE monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+        GROUP BY sede, entidad, es_moto),
+      reduc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
+        WHERE (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
+          AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
+        GROUP BY sede, entidad, es_moto),
+      claves AS (SELECT sede, entidad, es_moto FROM ven UNION SELECT sede, entidad, es_moto FROM reduc)
+      SELECT k.sede, k.entidad, k.es_moto,
+        ROUND(COALESCE(ven.monto,0) - COALESCE(reduc.monto,0))::int AS neto,
+        GREATEST(COALESCE(ven.ops,0) - COALESCE(reduc.ops,0), 0)::int AS ops,
+        ROUND(COALESCE(ven.monto,0))::int AS monto_bruto,
+        COALESCE(ven.ops,0)::int AS ops_bruto
+      FROM claves k
+      LEFT JOIN ven   ON ven.sede=k.sede   AND ven.entidad IS NOT DISTINCT FROM k.entidad   AND ven.es_moto=k.es_moto
+      LEFT JOIN reduc ON reduc.sede=k.sede AND reduc.entidad IS NOT DISTINCT FROM k.entidad AND reduc.es_moto=k.es_moto
+      WHERE COALESCE(k.sede,'') <> ''
+      ORDER BY k.sede, k.entidad`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
@@ -2658,6 +2664,7 @@ app.get('/reporte-global', async (req, res) => {
 // cuadro, así que el match es exacto (sin reimplementar la normalización de sede acá).
 // `entidad` vacío/omitido = sin entidad (LEONCITO o nula).
 app.get('/reporte-global-detalle', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
@@ -2671,8 +2678,7 @@ app.get('/reporte-global-detalle', async (req, res) => {
       SELECT vendedor, cliente_venta AS cliente, productos AS producto,
         ROUND(monto_consolidado)::int AS monto, dia_cv, mes_cv, anio_cv
       FROM ventas
-      WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-        AND monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+      WHERE monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
         AND sede = ANY($4::text[])
         AND NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') IS NOT DISTINCT FROM NULLIF($5,'')
       ORDER BY anio_cv DESC, mes_cv DESC, dia_cv DESC, monto_consolidado DESC`,
@@ -2681,15 +2687,17 @@ app.get('/reporte-global-detalle', async (req, res) => {
   } catch (e) { console.error('❌ GET /reporte-global-detalle:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
-// GET /reporte-global-motos?anio=&mes= → motos por (sede, credito, marca, tipo, vendedor),
-//   SOLO de motos con fecha de venta (anio_cv/mes_cv/dia_cv) dentro del periodo pedido —
-//   mismo criterio que /reporte-global: una NC/incautación de OTRO mes no resta acá.
+// GET /reporte-global-motos?anio=&mes= → motos por (sede, credito, marca, tipo, vendedor).
+//   Mismo criterio de "mes congelado" que /reporte-global: el mes de la venta (CV) manda
+//   siempre su número real; una NC/incautación resta en SU mes de afectación (AF), sea el
+//   mismo mes (neteando a 0) u otro posterior (resta sola, sin tocar el mes de la venta).
 //   · credito: GLOBAL (entidad GLOBAL GO) / PROPIO (resto, principalmente LEONCITO).
 //   · marca:   WANXIN / SSENDA / OTRAS (según el texto del producto).
 //   · tipo:    MOTO CARGUERA (si el producto dice 'TRIMOTO DE CARGA'), MOTO LINEAL, MOTOTAXI.
 //     OJO carguera: en estado_tipo_producto figura como 'MOTO TAXI'; se reclasifica por el
 //     texto 'TRIMOTO DE CARGA' del producto (las mototaxis dicen 'TRIMOTO DE PASAJEROS').
 app.get('/reporte-global-motos', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
@@ -2709,17 +2717,25 @@ app.get('/reporte-global-motos', async (req, res) => {
                  OR UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO%' THEN 'MOTOTAXI'
                ELSE 'OTRO' END AS tipo,
           COALESCE(NULLIF(TRIM(vendedor),''), '(sin vendedor)') AS vendedor,
-          sede, estado_venta, anio_cv, mes_cv, dia_cv
+          sede, estado_venta, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af
         FROM ventas
         WHERE UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'
-      )
-      SELECT sede, credito, marca, tipo, vendedor,
-        COUNT(*)::int AS motos,
-        COUNT(*)::int AS motos_bruto
-      FROM ent
-      WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-        AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-      GROUP BY sede, credito, marca, tipo, vendedor
+      ),
+      ven AS (SELECT sede, credito, marca, tipo, vendedor, COUNT(*)::int AS motos FROM ent
+        WHERE anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+        GROUP BY sede, credito, marca, tipo, vendedor),
+      reduc AS (SELECT sede, credito, marca, tipo, vendedor, COUNT(*)::int AS motos FROM ent
+        WHERE (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
+          AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
+        GROUP BY sede, credito, marca, tipo, vendedor),
+      claves AS (SELECT sede, credito, marca, tipo, vendedor FROM ven UNION SELECT sede, credito, marca, tipo, vendedor FROM reduc)
+      SELECT k.sede, k.credito, k.marca, k.tipo, k.vendedor,
+        GREATEST(COALESCE(ven.motos,0) - COALESCE(reduc.motos,0), 0)::int AS motos,
+        COALESCE(ven.motos,0)::int AS motos_bruto
+      FROM claves k
+      LEFT JOIN ven   ON ven.sede=k.sede   AND ven.credito=k.credito   AND ven.marca=k.marca   AND ven.tipo=k.tipo   AND ven.vendedor=k.vendedor
+      LEFT JOIN reduc ON reduc.sede=k.sede AND reduc.credito=k.credito AND reduc.marca=k.marca AND reduc.tipo=k.tipo AND reduc.vendedor=k.vendedor
+      WHERE COALESCE(ven.motos,0) > 0 OR COALESCE(reduc.motos,0) > 0
       ORDER BY sede, motos_bruto DESC`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
@@ -2729,6 +2745,7 @@ app.get('/reporte-global-motos', async (req, res) => {
 // Para el cuadro "Margen por Línea Real × Sede" del Reporte Global. La sede viene SIN el
 // prefijo 'SEDE RELENOR' (el front la normaliza igual que las demás).
 app.get('/margen-linea-sede', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureMargenSchema();
