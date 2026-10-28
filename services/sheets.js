@@ -2364,6 +2364,54 @@ app.post('/gestion-call/migrar-brenda-realzza', async (req, res) => {
   } finally { cliente.release(); }
 });
 
+// POST /gestion-call/migrar-call-a-realzza-nov?key=pase-realzza-nov2026 — migración one-shot.
+// Mueve las gestiones de Karen Quispe, Judy, Maria Morales y Patricia Moreto (su pase de
+// Call a Realzza Chiclayo) de gestion_call → gestion_realzza desde el 1-nov-2026 en
+// adelante. Mismo criterio que migrar-brenda-realzza: transaccional, idempotente (solo
+// mueve lo que siga en gestion_call), tipo_cliente → tipo_base, asesor_contact → asesor_realzza.
+app.post('/gestion-call/migrar-call-a-realzza-nov', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  if (req.query.key !== 'pase-realzza-nov2026') return res.status(403).json({ success: false, message: 'Clave inválida.' });
+  const cliente = await pgPool.connect();
+  try {
+    await ensureGestionCallSchema();
+    await ensureGestionRealzzaSchema();
+    const NOMBRES = ['QUISPE FONSECA KAREN AIMEE', 'TORRES ALVARADO JUDY ESMERALDA', 'MORALES ÑIQUE MARIA CANDELARIA', 'MORETO DELGADO PATRICIA ESTEFANY'];
+    const WHERE = `(${NOMBRES.map((_, i) => `asesor_contact ILIKE $${i + 1}`).join(' OR ')})
+      AND marca_temporal >= '2026-11-01'`;
+    const params = NOMBRES.map(n => `%${n}%`);
+    await cliente.query('BEGIN');
+    const antes = await cliente.query(`SELECT COUNT(*)::int AS n FROM gestion_call WHERE ${WHERE}`, params);
+    const ins = await cliente.query(`
+      INSERT INTO gestion_realzza (
+        marca_temporal, marca_temporal_raw, asesor_realzza, sede, tipo_base,
+        dni_cliente, celular_gestionado, estado_gestion, medio_primer_contacto,
+        resultado_gestion, producto_interes, motivo_interes, motivo_agendamiento,
+        fecha_interes_agendamiento, hora_interes_agendamiento, comentario_agendamiento,
+        fecha_interes_derivacion, hora_interes_derivacion, comentario_derivacion,
+        motivo_no_interes, comentario_no_interes, motivo_no_atendible, comentario_no_atendible,
+        motivos_tercero_relacionado, fecha_rellamada, hora_rellamada, numero_titular_actual,
+        motivo_no_contacto, motivo_no_cierre, comentario_venta_no_concretada, origen)
+      SELECT
+        marca_temporal, marca_temporal_raw, asesor_contact, sede, tipo_cliente,
+        dni_cliente, celular_gestionado, estado_gestion, medio_primer_contacto,
+        resultado_gestion, producto_interes, motivo_interes, motivo_agendamiento,
+        fecha_interes_agendamiento, hora_interes_agendamiento, comentario_agendamiento,
+        fecha_interes_derivacion, hora_interes_derivacion, comentario_derivacion,
+        motivo_no_interes, comentario_no_interes, motivo_no_atendible, comentario_no_atendible,
+        motivos_tercero_relacionado, fecha_rellamada, hora_rellamada, numero_titular_actual,
+        motivo_no_contacto, motivo_no_cierre, comentario_venta_no_concretada, COALESCE(origen,'app')
+      FROM gestion_call WHERE ${WHERE}`, params);
+    const del = await cliente.query(`DELETE FROM gestion_call WHERE ${WHERE}`, params);
+    await cliente.query('COMMIT');
+    res.json({ success: true, encontradas: antes.rows[0].n, insertadas: ins.rowCount, eliminadas: del.rowCount });
+  } catch (e) {
+    await cliente.query('ROLLBACK').catch(() => {});
+    console.error('❌ POST /gestion-call/migrar-call-a-realzza-nov', e);
+    res.status(500).json({ success: false, message: 'No se pudo migrar.' });
+  } finally { cliente.release(); }
+});
+
 // POST /gestion-call/match — { dnis: [...] } → { <dni>: {asesor, tipo_cliente, sede, kommo, celular} }
 // Devuelve la ÚLTIMA gestión Call de cada DNI (para atribuir las ventas del Excel).
 app.post('/gestion-call/match', async (req, res) => {
