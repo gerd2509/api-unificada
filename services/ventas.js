@@ -322,6 +322,7 @@ app.get('/ventas/estado', async (req, res) => {
 });
 
 app.get('/ventas', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
@@ -363,34 +364,29 @@ app.get('/ventas', async (req, res) => {
 });
 
 // GET /ventas/evolutivo — neto REAL mensual por SEDE (todos los meses/años) para el gráfico
-// evolutivo de Ventas Sedes: ventas (por mes CV) menos NC arrastradas (por mes AF) menos
-// incautaciones arrastradas (por mes AF). Las NC/INC del mismo mes (CV=AF) netean a 0.
+// evolutivo de Ventas Sedes: el mes de la VENTA (CV) manda siempre su número real
+// (congelado); la NC/incautación resta aparte en SU PROPIO mes de afectación (AF) — mismo
+// mes → netea a 0, mes posterior → resta sola, sin tocar el mes de la venta.
 // Devuelve [{sede, anio, mes, ventas, nc, inc, neto}].
 app.get('/ventas/evolutivo', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
     const rows = await cached('ventas/evolutivo', req.query.fresh, async () => (await pgPool.query(`
       WITH ven AS (
         SELECT sede, anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
-        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-          AND monto_consolidado > 0 AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL
+        WHERE monto_consolidado > 0 AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL
         GROUP BY sede, anio_cv, mes_cv
       ),
       ncnr AS (
-        -- Solo restan las NC ARRASTRADAS (venta de un mes anterior anulada este mes).
-        -- Las del mismo mes (CV = AF) netean a 0: su venta no está en 'ven' (que
-        -- excluye los registros NC), así que sumarlas y restarlas se cancela → no restan.
         SELECT n.sede, n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
         WHERE UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
-          AND (n.anio_cv IS DISTINCT FROM n.anio_af OR n.mes_cv IS DISTINCT FROM n.mes_af)
         GROUP BY n.sede, n.anio_af, n.mes_af
       ),
       inc AS (
-        -- Igual que las NC: solo restan las incautaciones arrastradas; las del mismo mes netean.
         SELECT sede, anio_af AS anio, mes_af AS mes, SUM(monto_consolidado) AS monto FROM ventas
         WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af IS NOT NULL AND mes_af IS NOT NULL
-          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
         GROUP BY sede, anio_af, mes_af
       ),
       claves AS (
@@ -2610,11 +2606,10 @@ app.get('/avance-vendedor', async (req, res) => {
 //             aliados (≠LEONCITO) y motos (es_moto) propio(LEONCITO)/GLOBAL GO.
 //   El mes de la VENTA (anio_cv/mes_cv/dia_cv) queda SIEMPRE fijo con su número real,
 //   así se le aplique una nota de crédito/incautación después — ese mes ya cerró y no
-//   se recalcula. La nota de crédito/incautación resta en SU PROPIO mes de afectación
-//   (anio_af/mes_af/dia_af), sea el mismo mes de la venta (neteando a 0 ese mes) u otro
-//   mes posterior (ahí resta sola, sin "borrar" la venta original de su mes).
-//   monto_bruto/ops_bruto = solo la parte de ventas (sin restar notas de crédito/
-//   incautaciones), para cuadrar con el popup de detalle y con "Ventas Campo".
+//   se recalcula. Las tablas de este módulo (Aliados, Motos) muestran el BRUTO por mes de
+//   venta tal cual aparece en el Excel importado (Carga Ventas) — sin restar notas de
+//   crédito/incautaciones de ningún mes. neto/ops quedan iguales a monto_bruto/ops_bruto
+//   (se mantienen ambos nombres por compatibilidad con el resto del código).
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/reporte-global', async (req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -2629,27 +2624,19 @@ app.get('/reporte-global', async (req, res) => {
         SELECT sede,
           NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') AS entidad,
           (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto,
-          estado_venta, monto_consolidado, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af
+          monto_consolidado, anio_cv, mes_cv, dia_cv
         FROM ventas
-      ),
-      ven AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
-        WHERE monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-        GROUP BY sede, entidad, es_moto),
-      reduc AS (SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops FROM ent
-        WHERE (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
-          AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
-        GROUP BY sede, entidad, es_moto),
-      claves AS (SELECT sede, entidad, es_moto FROM ven UNION SELECT sede, entidad, es_moto FROM reduc)
-      SELECT k.sede, k.entidad, k.es_moto,
-        ROUND(COALESCE(ven.monto,0) - COALESCE(reduc.monto,0))::int AS neto,
-        GREATEST(COALESCE(ven.ops,0) - COALESCE(reduc.ops,0), 0)::int AS ops,
-        ROUND(COALESCE(ven.monto,0))::int AS monto_bruto,
-        COALESCE(ven.ops,0)::int AS ops_bruto
-      FROM claves k
-      LEFT JOIN ven   ON ven.sede=k.sede   AND ven.entidad IS NOT DISTINCT FROM k.entidad   AND ven.es_moto=k.es_moto
-      LEFT JOIN reduc ON reduc.sede=k.sede AND reduc.entidad IS NOT DISTINCT FROM k.entidad AND reduc.es_moto=k.es_moto
-      WHERE COALESCE(k.sede,'') <> ''
-      ORDER BY k.sede, k.entidad`, [anio, mes, dia])).rows);
+      )
+      SELECT sede, entidad, es_moto,
+        ROUND(SUM(monto_consolidado))::int AS neto,
+        COUNT(*)::int AS ops,
+        ROUND(SUM(monto_consolidado))::int AS monto_bruto,
+        COUNT(*)::int AS ops_bruto
+      FROM ent
+      WHERE monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+        AND COALESCE(sede,'') <> ''
+      GROUP BY sede, entidad, es_moto
+      ORDER BY sede, entidad`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
@@ -2685,10 +2672,9 @@ app.get('/reporte-global-detalle', async (req, res) => {
   } catch (e) { console.error('❌ GET /reporte-global-detalle:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
-// GET /reporte-global-motos?anio=&mes= → motos por (sede, credito, marca, tipo, vendedor).
-//   Mismo criterio de "mes congelado" que /reporte-global: el mes de la venta (CV) manda
-//   siempre su número real; una NC/incautación resta en SU mes de afectación (AF), sea el
-//   mismo mes (neteando a 0) u otro posterior (resta sola, sin tocar el mes de la venta).
+// GET /reporte-global-motos?anio=&mes= → motos por (sede, credito, marca, tipo, vendedor),
+//   BRUTO por mes de venta tal cual el Excel importado (Carga Ventas) — sin restar notas
+//   de crédito/incautaciones de ningún mes. motos/motos_bruto quedan iguales.
 //   · credito: GLOBAL (entidad GLOBAL GO) / PROPIO (resto, principalmente LEONCITO).
 //   · marca:   WANXIN / SSENDA / OTRAS (según el texto del producto).
 //   · tipo:    MOTO CARGUERA (si el producto dice 'TRIMOTO DE CARGA'), MOTO LINEAL, MOTOTAXI.
@@ -2715,25 +2701,16 @@ app.get('/reporte-global-motos', async (req, res) => {
                  OR UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO%' THEN 'MOTOTAXI'
                ELSE 'OTRO' END AS tipo,
           COALESCE(NULLIF(TRIM(vendedor),''), '(sin vendedor)') AS vendedor,
-          sede, estado_venta, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af
+          sede, anio_cv, mes_cv, dia_cv
         FROM ventas
         WHERE UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'
-      ),
-      ven AS (SELECT sede, credito, marca, tipo, vendedor, COUNT(*)::int AS motos FROM ent
-        WHERE anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-        GROUP BY sede, credito, marca, tipo, vendedor),
-      reduc AS (SELECT sede, credito, marca, tipo, vendedor, COUNT(*)::int AS motos FROM ent
-        WHERE (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%')
-          AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
-        GROUP BY sede, credito, marca, tipo, vendedor),
-      claves AS (SELECT sede, credito, marca, tipo, vendedor FROM ven UNION SELECT sede, credito, marca, tipo, vendedor FROM reduc)
-      SELECT k.sede, k.credito, k.marca, k.tipo, k.vendedor,
-        GREATEST(COALESCE(ven.motos,0) - COALESCE(reduc.motos,0), 0)::int AS motos,
-        COALESCE(ven.motos,0)::int AS motos_bruto
-      FROM claves k
-      LEFT JOIN ven   ON ven.sede=k.sede   AND ven.credito=k.credito   AND ven.marca=k.marca   AND ven.tipo=k.tipo   AND ven.vendedor=k.vendedor
-      LEFT JOIN reduc ON reduc.sede=k.sede AND reduc.credito=k.credito AND reduc.marca=k.marca AND reduc.tipo=k.tipo AND reduc.vendedor=k.vendedor
-      WHERE COALESCE(ven.motos,0) > 0 OR COALESCE(reduc.motos,0) > 0
+      )
+      SELECT sede, credito, marca, tipo, vendedor,
+        COUNT(*)::int AS motos,
+        COUNT(*)::int AS motos_bruto
+      FROM ent
+      WHERE anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+      GROUP BY sede, credito, marca, tipo, vendedor
       ORDER BY sede, motos_bruto DESC`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
