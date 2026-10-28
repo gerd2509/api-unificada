@@ -1733,6 +1733,168 @@ app.put('/cap/:id', async (req, res) => {
   } catch (e) { console.error('❌ PUT /cap/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 📅 HORARIOS (rotación de domingos + descanso entre semana) — por ahora solo
+// Realzza Chiclayo. El calendario del mes NO se guarda día por día: se arma al
+// vuelo desde estas reglas (qué par de domingos descansa cada asesor/a, y su
+// grupo de rotación o día fijo entre semana) + los cambios puntuales (transpasos)
+// registrados aparte. Si cambia una regla, el mes entero se recalcula solo.
+// ═════════════════════════════════════════════════════════════════════════════
+let horariosListos = false;
+async function ensureHorariosSchema() {
+  if (!pgPool || horariosListos) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS horario_slots (
+      id BIGSERIAL PRIMARY KEY,
+      sede TEXT NOT NULL,
+      anio INTEGER NOT NULL,
+      mes INTEGER NOT NULL,
+      etiqueta TEXT,
+      nota TEXT,
+      domingos INTEGER[] NOT NULL,
+      cuenta_cuota BOOLEAN NOT NULL DEFAULT true,
+      creado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_horslots_sede_mes ON horario_slots (sede, anio, mes);
+    CREATE TABLE IF NOT EXISTS horario_slot_asesores (
+      slot_id BIGINT NOT NULL REFERENCES horario_slots(id) ON DELETE CASCADE,
+      asesor TEXT NOT NULL,
+      PRIMARY KEY (slot_id, asesor)
+    );
+    CREATE TABLE IF NOT EXISTS horario_rotacion (
+      sede TEXT NOT NULL,
+      asesor TEXT NOT NULL,
+      grupo INTEGER,
+      dia_fijo INTEGER,
+      inamovible BOOLEAN NOT NULL DEFAULT false,
+      nota TEXT,
+      actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (sede, asesor)
+    );
+    CREATE TABLE IF NOT EXISTS horario_cambios (
+      id BIGSERIAL PRIMARY KEY,
+      sede TEXT NOT NULL,
+      asesor TEXT NOT NULL,
+      fecha DATE NOT NULL,
+      tipo TEXT NOT NULL,
+      motivo TEXT,
+      creado_por TEXT,
+      creado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_horcambios_sede_fecha ON horario_cambios (sede, fecha);
+  `);
+  horariosListos = true;
+}
+
+// GET /horarios/reglas?sede=&anio=&mes= → slots (con sus asesores) + rotación vigente.
+app.get('/horarios/reglas', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureHorariosSchema();
+    const sede = String(req.query.sede || '').trim();
+    if (!sede) return res.status(400).json({ success: false, message: 'Falta la sede.' });
+    const anio = req.query.anio ? parseInt(req.query.anio, 10) : new Date().getFullYear();
+    const mes = req.query.mes ? parseInt(req.query.mes, 10) : (new Date().getMonth() + 1);
+    const slots = await pgPool.query(
+      `SELECT id, etiqueta, nota, domingos, cuenta_cuota FROM horario_slots
+       WHERE sede = $1 AND anio = $2 AND mes = $3 ORDER BY id`, [sede, anio, mes]);
+    const asesoresPorSlot = await pgPool.query(
+      `SELECT sa.slot_id, sa.asesor FROM horario_slot_asesores sa
+       JOIN horario_slots s ON s.id = sa.slot_id WHERE s.sede = $1 AND s.anio = $2 AND s.mes = $3`, [sede, anio, mes]);
+    const mapa = new Map();
+    asesoresPorSlot.rows.forEach(r => { if (!mapa.has(r.slot_id)) mapa.set(r.slot_id, []); mapa.get(r.slot_id).push(r.asesor); });
+    const rotacion = await pgPool.query(
+      `SELECT asesor, grupo, dia_fijo, inamovible, nota FROM horario_rotacion WHERE sede = $1`, [sede]);
+    res.json({ slots: slots.rows.map(s => ({ ...s, asesores: mapa.get(s.id) || [] })), rotacion: rotacion.rows });
+  } catch (e) { console.error('❌ GET /horarios/reglas:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// PUT /horarios/reglas — reemplaza las reglas de una sede+mes (slots de domingo) y la
+// rotación entre semana vigente (no es por mes). Body: { sede, anio, mes,
+// slots:[{etiqueta,nota,domingos,cuentaCuota,asesores:[]}], rotacion:[{asesor,grupo,diaFijo,inamovible,nota}] }
+app.put('/horarios/reglas', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const client = await pgPool.connect();
+  try {
+    await ensureHorariosSchema();
+    const b = req.body || {};
+    const sede = String(b.sede || '').trim();
+    const anio = parseInt(b.anio, 10);
+    const mes = parseInt(b.mes, 10);
+    if (!sede || !anio || !mes) return res.status(400).json({ success: false, message: 'Faltan sede/anio/mes.' });
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM horario_slots WHERE sede = $1 AND anio = $2 AND mes = $3`, [sede, anio, mes]);
+    for (const s of (b.slots || [])) {
+      const { rows } = await client.query(
+        `INSERT INTO horario_slots (sede, anio, mes, etiqueta, nota, domingos, cuenta_cuota) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        [sede, anio, mes, s.etiqueta || '', s.nota || null, s.domingos || [], s.cuentaCuota !== false]);
+      const slotId = rows[0].id;
+      for (const asesor of (s.asesores || [])) {
+        await client.query(`INSERT INTO horario_slot_asesores (slot_id, asesor) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [slotId, asesor]);
+      }
+    }
+    for (const r of (b.rotacion || [])) {
+      await client.query(
+        `INSERT INTO horario_rotacion (sede, asesor, grupo, dia_fijo, inamovible, nota, actualizado_en)
+         VALUES ($1,$2,$3,$4,$5,$6, now())
+         ON CONFLICT (sede, asesor) DO UPDATE SET grupo=$3, dia_fijo=$4, inamovible=$5, nota=$6, actualizado_en=now()`,
+        [sede, r.asesor, r.grupo ?? null, r.diaFijo ?? null, !!r.inamovible, r.nota || null]);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) { await client.query('ROLLBACK'); console.error('❌ PUT /horarios/reglas:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+  finally { client.release(); }
+});
+
+// GET /horarios/cambios?sede=&anio=&mes= → cambios directos / transpasos del mes.
+app.get('/horarios/cambios', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureHorariosSchema();
+    const sede = String(req.query.sede || '').trim();
+    const anio = parseInt(req.query.anio, 10);
+    const mes = parseInt(req.query.mes, 10);
+    if (!sede || !anio || !mes) return res.status(400).json({ success: false, message: 'Faltan sede/anio/mes.' });
+    const { rows } = await pgPool.query(
+      `SELECT id, asesor, fecha, tipo, motivo, creado_por, creado_en FROM horario_cambios
+       WHERE sede = $1 AND EXTRACT(YEAR FROM fecha) = $2 AND EXTRACT(MONTH FROM fecha) = $3
+       ORDER BY fecha, asesor`, [sede, anio, mes]);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /horarios/cambios:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// POST /horarios/cambios — registra un cambio directo / transpaso puntual.
+app.post('/horarios/cambios', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureHorariosSchema();
+    const b = req.body || {};
+    const sede = String(b.sede || '').trim();
+    const asesor = String(b.asesor || '').trim();
+    const fecha = String(b.fecha || '').trim();
+    const tipo = String(b.tipo || '').trim();
+    if (!sede || !asesor || !fecha || !tipo) return res.status(400).json({ success: false, message: 'Faltan datos.' });
+    const creadoPor = (req.usuario && (req.usuario.nombre || req.usuario.usuario)) || '';
+    const { rows } = await pgPool.query(
+      `INSERT INTO horario_cambios (sede, asesor, fecha, tipo, motivo, creado_por) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [sede, asesor, fecha, tipo, String(b.motivo || '').trim() || null, creadoPor]);
+    res.json({ success: true, id: rows[0].id });
+  } catch (e) { console.error('❌ POST /horarios/cambios:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// DELETE /horarios/cambios/:id — quita un cambio directo registrado.
+app.delete('/horarios/cambios/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureHorariosSchema();
+    const { rowCount } = await pgPool.query(`DELETE FROM horario_cambios WHERE id = $1`, [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'No encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /horarios/cambios/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
 // DELETE /cap/:id — baja definitiva (para "renuncia" usar estado=RENUNCIA con PUT).
 app.delete('/cap/:id', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
