@@ -1758,11 +1758,10 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
 });
 
 // GET /ventas-realzza/evolutivo — neto REAL mensual para el gráfico evolutivo.
-// Por mes = ventas (Realzza-store, por mes de venta) − NC NO refacturadas (por mes de AF).
-// Una NC es "refacturada" si el mismo cliente tiene otra venta (no NC) ese mismo mes → no
-// resta (se reemplazó). Se acota a los meses que ya tienen ventas en ventas_realzza (evita
-// meses viejos con solo-NC en negativo). Así cada mes coincide con el Monto Real (ventas −
-// NC + refacturación) del módulo.
+// Por mes = ventas (Realzza-store, por mes de VENTA, congelado) − NC/incautaciones por su
+// PROPIO mes de afectación (mismo mes → netea a 0; mes posterior → resta sola, sin tocar
+// el mes de la venta — igual criterio que /reporte-global). Se acota a los meses que ya
+// tienen ventas en ventas_realzza (evita meses viejos con solo-NC en negativo).
 app.get('/ventas-realzza/evolutivo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
@@ -1781,30 +1780,26 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
       ),
       ven AS (
         SELECT anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
-        WHERE sede ILIKE '%REALZZA%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%'
-          AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
-          AND monto_consolidado > 0
+        WHERE sede ILIKE '%REALZZA%' AND monto_consolidado > 0
           ${sedeTiendaSQL('sede', tienda)}
         GROUP BY anio_cv, mes_cv
       ),
-      ncnr AS (
-        -- Restan SOLO las "arrastradas" (venta de un mes anterior anulada este mes,
-        -- CV ≠ AF): NOTA DE CRÉDITO e INCAUTACIÓN. Las del MISMO mes (CV=AF) netean a 0
-        -- (ya excluidas de ven/meses) → no restan de nuevo.
+      nc AS (
+        -- Resta en SU PROPIO mes de afectación (AF): mismo mes de la venta → netea a 0
+        -- (ven ya la cuenta completa); mes posterior → resta sola, sin tocar el mes de venta.
         SELECT n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
         WHERE n.sede ILIKE '%REALZZA%' ${sedeTiendaSQL('n.sede', tienda)}
           AND (UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(n.estado_venta,'')) LIKE '%INCAUTAC%')
           AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
-          AND NOT (n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af)
         GROUP BY n.anio_af, n.mes_af
       )
       SELECT m.anio, m.mes,
              ROUND(COALESCE(ven.monto,0))::int AS ventas,
-             ROUND(COALESCE(ncnr.monto,0))::int AS nc,
-             ROUND(COALESCE(ven.monto,0) - COALESCE(ncnr.monto,0))::int AS neto
+             ROUND(COALESCE(nc.monto,0))::int AS nc,
+             ROUND(COALESCE(ven.monto,0) - COALESCE(nc.monto,0))::int AS neto
       FROM meses m
-      LEFT JOIN ven  ON ven.anio  = m.anio AND ven.mes  = m.mes
-      LEFT JOIN ncnr ON ncnr.anio = m.anio AND ncnr.mes = m.mes
+      LEFT JOIN ven ON ven.anio = m.anio AND ven.mes = m.mes
+      LEFT JOIN nc  ON nc.anio  = m.anio AND nc.mes  = m.mes
       WHERE m.anio > 0 AND m.mes > 0
       ORDER BY m.anio, m.mes`);
     res.json(rows);
