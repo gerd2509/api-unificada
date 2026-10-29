@@ -2277,6 +2277,209 @@ registrarLeads('call', 'leads-kommo-call');
 registrarLeads('realzza', 'leads-kommo-realzza');
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 🔍 AUDITORÍA KOMMO (Realzza) — sortea una muestra de leads YA RESPONDIDOS por
+// embudo, para revisar a mano (en el propio Kommo) si la respuesta fue adecuada.
+// No se guarda día por día: cada "sorteo" crea un LOTE con sus leads elegidos al
+// azar (mínimo N por embudo); cada lead del lote se revisa aparte (resultado +
+// comentario + fotos de evidencia) y queda con su fecha de revisión.
+// ─────────────────────────────────────────────────────────────────────────────
+let auditoriaKommoListo = false;
+async function ensureAuditoriaKommoSchema() {
+  if (!pgPool || auditoriaKommoListo) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS auditoria_kommo_lotes (
+      id BIGSERIAL PRIMARY KEY,
+      tienda TEXT NOT NULL,
+      anio INTEGER NOT NULL,
+      mes INTEGER NOT NULL,
+      cantidad_por_embudo INTEGER NOT NULL,
+      creado_por TEXT,
+      creado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_audklotes_tienda ON auditoria_kommo_lotes (tienda, anio, mes);
+    CREATE TABLE IF NOT EXISTS auditoria_kommo_leads (
+      id BIGSERIAL PRIMARY KEY,
+      lote_id BIGINT NOT NULL REFERENCES auditoria_kommo_lotes(id) ON DELETE CASCADE,
+      lead_id BIGINT NOT NULL,
+      nombre_cliente TEXT,
+      embudo TEXT,
+      responsable TEXT,
+      fecha_creacion_lead TEXT,
+      resultado TEXT NOT NULL DEFAULT 'pendiente',
+      comentario TEXT,
+      fotos JSONB NOT NULL DEFAULT '[]',
+      revisado_por TEXT,
+      revisado_en TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS ix_audkleads_lote ON auditoria_kommo_leads (lote_id);
+  `);
+  auditoriaKommoListo = true;
+}
+
+// ── Supabase Storage (fotos de evidencia, bucket privado compartido con Registro
+// Supervisor — misma cuenta, carpeta aparte "auditoria-kommo/"). ──
+const AUDK_SB_URL = process.env.SUPABASE_URL || '';
+const AUDK_SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const AUDK_BUCKET = 'supervisor-fotos';
+const audkStorageOn = () => !!(AUDK_SB_URL && AUDK_SB_KEY);
+const audkHeaders = (extra = {}) => ({ Authorization: `Bearer ${AUDK_SB_KEY}`, apikey: AUDK_SB_KEY, ...extra });
+async function audkSubirFoto(dataUri, leadRowId, i) {
+  if (typeof dataUri !== 'string' || !dataUri.startsWith('data:') || !audkStorageOn()) return dataUri;
+  const m = /^data:(image\/\w+);base64,(.*)$/s.exec(dataUri);
+  if (!m) return dataUri;
+  const mime = m[1], buf = Buffer.from(m[2], 'base64');
+  const ext = mime.split('/')[1] === 'jpeg' ? 'jpg' : mime.split('/')[1];
+  const path = `auditoria-kommo/${leadRowId}/${i}-${Date.now()}.${ext}`;
+  const r = await fetch(`${AUDK_SB_URL}/storage/v1/object/${AUDK_BUCKET}/${path}`, {
+    method: 'POST', headers: audkHeaders({ 'Content-Type': mime, 'x-upsert': 'true' }), body: buf,
+  });
+  if (!r.ok) throw new Error('Storage upload ' + r.status);
+  return path;
+}
+async function audkUrlFirmada(v) {
+  if (typeof v !== 'string' || !v || v.startsWith('data:') || v.startsWith('http') || !audkStorageOn()) return v;
+  try {
+    const r = await fetch(`${AUDK_SB_URL}/storage/v1/object/sign/${AUDK_BUCKET}/${v}`, {
+      method: 'POST', headers: audkHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ expiresIn: 7200 }),
+    });
+    if (!r.ok) return v;
+    const j = await r.json();
+    return j.signedURL ? `${AUDK_SB_URL}/storage/v1${j.signedURL}` : v;
+  } catch { return v; }
+}
+const audkFirmarFotos = (arr) => Promise.all((arr || []).map(audkUrlFirmada));
+
+// Mezcla Fisher-Yates in-place.
+function barajar(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// POST /leads-kommo-realzza/auditoria/sortear — body: { tienda, anio, mes, cantidadPorEmbudo }
+// Sortea N leads al azar de CADA embudo (solo entre los YA RESPONDIDOS del período/
+// tienda elegidos) y crea un lote nuevo con ellos (resultado 'pendiente' hasta revisar).
+app.post('/leads-kommo-realzza/auditoria/sortear', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const client = await pgPool.connect();
+  try {
+    await ensureAuditoriaKommoSchema();
+    const b = req.body || {};
+    const anio = parseInt(b.anio, 10);
+    const mes = parseInt(b.mes, 10);
+    const cantidad = Math.max(1, parseInt(b.cantidadPorEmbudo, 10) || 5);
+    const tienda = tiendaRzParam(b.tienda);
+    if (!anio || !mes) return res.status(400).json({ success: false, message: 'Faltan anio/mes.' });
+    const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+
+    const { rows } = await pgPool.query(
+      `SELECT id, nombre_cliente, embudo, responsable, (dia_cr || '/' || mes_cr || '/' || anio_cr) AS fecha_creacion_lead
+       FROM leads_kommo_realzza
+       WHERE anio_cr = $1 AND mes_cr = $2 AND modificado_por IS NOT NULL AND TRIM(modificado_por) <> '' ${filtroTienda}`,
+      [anio, mes]);
+
+    const porEmbudo = new Map();
+    for (const r of rows) {
+      const key = (r.embudo || '').toString().trim() || 'SIN EMBUDO';
+      if (!porEmbudo.has(key)) porEmbudo.set(key, []);
+      porEmbudo.get(key).push(r);
+    }
+    const elegidos = [];
+    for (const leads of porEmbudo.values()) elegidos.push(...barajar([...leads]).slice(0, cantidad));
+    if (!elegidos.length) return res.status(400).json({ success: false, message: 'No hay leads respondidos en ese período para sortear.' });
+
+    const creadoPor = (req.usuario && (req.usuario.nombre || req.usuario.usuario)) || '';
+    await client.query('BEGIN');
+    const { rows: loteRows } = await client.query(
+      `INSERT INTO auditoria_kommo_lotes (tienda, anio, mes, cantidad_por_embudo, creado_por)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id, creado_en`,
+      [tienda || 'TODAS', anio, mes, cantidad, creadoPor]);
+    const loteId = loteRows[0].id;
+    for (const l of elegidos) {
+      await client.query(
+        `INSERT INTO auditoria_kommo_leads (lote_id, lead_id, nombre_cliente, embudo, responsable, fecha_creacion_lead)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [loteId, l.id, l.nombre_cliente, l.embudo, l.responsable, l.fecha_creacion_lead]);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, loteId, total: elegidos.length, embudos: porEmbudo.size });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('❌ POST /leads-kommo-realzza/auditoria/sortear:', e);
+    res.status(500).json({ success: false, message: 'No se pudo sortear la auditoría.' });
+  } finally { client.release(); }
+});
+
+// GET /leads-kommo-realzza/auditoria/lotes?tienda=&anio=&mes= — histórico de lotes
+// con su resumen (bien/mejorar/pendiente), más reciente primero.
+app.get('/leads-kommo-realzza/auditoria/lotes', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAuditoriaKommoSchema();
+    const cond = ['1=1']; const params = [];
+    if (req.query.tienda) { params.push(tiendaRzParam(req.query.tienda) || String(req.query.tienda)); cond.push(`l.tienda = $${params.length}`); }
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`l.anio = $${params.length}`); }
+    if (req.query.mes) { params.push(parseInt(req.query.mes, 10)); cond.push(`l.mes = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      SELECT l.id, l.tienda, l.anio, l.mes, l.cantidad_por_embudo, l.creado_por, l.creado_en,
+        COUNT(k.id)::int AS total,
+        COUNT(*) FILTER (WHERE k.resultado = 'bien')::int AS bien,
+        COUNT(*) FILTER (WHERE k.resultado = 'mejorar')::int AS mejorar,
+        COUNT(*) FILTER (WHERE k.resultado = 'pendiente')::int AS pendiente
+      FROM auditoria_kommo_lotes l
+      LEFT JOIN auditoria_kommo_leads k ON k.lote_id = l.id
+      WHERE ${cond.join(' AND ')}
+      GROUP BY l.id ORDER BY l.id DESC`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /leads-kommo-realzza/auditoria/lotes:', e); res.status(500).json({ success: false, message: 'No se pudo obtener el histórico.' }); }
+});
+
+// GET /leads-kommo-realzza/auditoria/lotes/:id — detalle de un lote con sus leads.
+// `fotos` queda tal cual (rutas crudas, para reenviarlas al guardar); `fotosUrl` trae
+// las mismas ya firmadas (temporales, solo para mostrar la miniatura).
+app.get('/leads-kommo-realzza/auditoria/lotes/:id', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAuditoriaKommoSchema();
+    const id = parseInt(req.params.id, 10);
+    const { rows: lote } = await pgPool.query(`SELECT * FROM auditoria_kommo_lotes WHERE id = $1`, [id]);
+    if (!lote.length) return res.status(404).json({ success: false, message: 'Lote no encontrado.' });
+    const { rows: leads } = await pgPool.query(
+      `SELECT * FROM auditoria_kommo_leads WHERE lote_id = $1 ORDER BY embudo, id`, [id]);
+    for (const l of leads) l.fotosUrl = await audkFirmarFotos(l.fotos || []);
+    res.json({ lote: lote[0], leads });
+  } catch (e) { console.error('❌ GET /leads-kommo-realzza/auditoria/lotes/:id:', e); res.status(500).json({ success: false, message: 'No se pudo obtener el detalle.' }); }
+});
+
+// PUT /leads-kommo-realzza/auditoria/leads/:id — guarda la revisión de un lead.
+// Body: { resultado, comentario, fotos }. `fotos` es el array COMPLETO que debe
+// quedar: rutas ya subidas (se dejan igual) + fotos nuevas en base64 (se suben recién
+// acá a Storage y se reemplazan por su ruta).
+app.put('/leads-kommo-realzza/auditoria/leads/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAuditoriaKommoSchema();
+    const id = parseInt(req.params.id, 10);
+    const b = req.body || {};
+    const resultado = ['bien', 'mejorar', 'pendiente'].includes(b.resultado) ? b.resultado : 'pendiente';
+    const entrada = Array.isArray(b.fotos) ? b.fotos : [];
+    const fotos = await Promise.all(entrada.map((f, i) => audkStorageOn() ? audkSubirFoto(f, id, i) : f));
+    const revisadoPor = (req.usuario && (req.usuario.nombre || req.usuario.usuario)) || '';
+    const { rowCount } = await pgPool.query(
+      `UPDATE auditoria_kommo_leads
+       SET resultado = $1, comentario = $2, fotos = $3, revisado_por = $4, revisado_en = now()
+       WHERE id = $5`,
+      [resultado, b.comentario || null, JSON.stringify(fotos), revisadoPor, id]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'No encontrado.' });
+    res.json({ success: true, fotos });
+  } catch (e) { console.error('❌ PUT /leads-kommo-realzza/auditoria/leads/:id:', e); res.status(500).json({ success: false, message: 'No se pudo guardar la revisión.' }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 📊 MARGEN DE VENTAS (reemplazo por codigo_cv; uno-a-muchos por producto)
 // ─────────────────────────────────────────────────────────────────────────────
 const MARGEN_COLS = [
