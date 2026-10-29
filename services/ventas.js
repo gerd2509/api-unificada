@@ -2455,6 +2455,25 @@ app.get('/leads-kommo-realzza/auditoria/lotes/:id', async (req, res) => {
   } catch (e) { console.error('❌ GET /leads-kommo-realzza/auditoria/lotes/:id:', e); res.status(500).json({ success: false, message: 'No se pudo obtener el detalle.' }); }
 });
 
+// POST /leads-kommo-realzza/auditoria/lotes/:id/sincronizar — refresca nombre_cliente,
+// embudo, responsable y fecha_creacion_lead de cada lead del lote contra el dato ACTUAL
+// de leads_kommo_realzza (por si el lead cambió de embudo/asesor en Kommo después del
+// sorteo, p.ej. una reasignación). No toca resultado/comentario/fotos/revisión.
+app.post('/leads-kommo-realzza/auditoria/lotes/:id/sincronizar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAuditoriaKommoSchema();
+    const id = parseInt(req.params.id, 10);
+    const { rowCount } = await pgPool.query(`
+      UPDATE auditoria_kommo_leads k
+      SET nombre_cliente = l.nombre_cliente, embudo = l.embudo, responsable = l.responsable,
+          fecha_creacion_lead = (l.dia_cr || '/' || l.mes_cr || '/' || l.anio_cr)
+      FROM leads_kommo_realzza l
+      WHERE k.lote_id = $1 AND l.id = k.lead_id`, [id]);
+    res.json({ success: true, actualizados: rowCount });
+  } catch (e) { console.error('❌ POST /leads-kommo-realzza/auditoria/lotes/:id/sincronizar:', e); res.status(500).json({ success: false, message: 'No se pudo sincronizar el lote.' }); }
+});
+
 // PUT /leads-kommo-realzza/auditoria/leads/:id — guarda la revisión de un lead.
 // Body: { resultado, comentario, fotos }. `fotos` es el array COMPLETO que debe
 // quedar: rutas ya subidas (se dejan igual) + fotos nuevas en base64 (se suben recién
