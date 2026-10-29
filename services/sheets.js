@@ -1797,7 +1797,7 @@ app.get('/horarios/reglas', async (req, res) => {
     const anio = req.query.anio ? parseInt(req.query.anio, 10) : new Date().getFullYear();
     const mes = req.query.mes ? parseInt(req.query.mes, 10) : (new Date().getMonth() + 1);
     const slots = await pgPool.query(
-      `SELECT id, etiqueta, nota, domingos, cuenta_cuota FROM horario_slots
+      `SELECT id, etiqueta, nota, domingos, cuenta_cuota AS "cuentaCuota" FROM horario_slots
        WHERE sede = $1 AND anio = $2 AND mes = $3 ORDER BY id`, [sede, anio, mes]);
     const asesoresPorSlot = await pgPool.query(
       `SELECT sa.slot_id, sa.asesor FROM horario_slot_asesores sa
@@ -1805,7 +1805,7 @@ app.get('/horarios/reglas', async (req, res) => {
     const mapa = new Map();
     asesoresPorSlot.rows.forEach(r => { if (!mapa.has(r.slot_id)) mapa.set(r.slot_id, []); mapa.get(r.slot_id).push(r.asesor); });
     const rotacion = await pgPool.query(
-      `SELECT asesor, grupo, dia_fijo, inamovible, nota FROM horario_rotacion WHERE sede = $1`, [sede]);
+      `SELECT asesor, grupo, dia_fijo AS "diaFijo", inamovible, nota FROM horario_rotacion WHERE sede = $1`, [sede]);
     res.json({ slots: slots.rows.map(s => ({ ...s, asesores: mapa.get(s.id) || [] })), rotacion: rotacion.rows });
   } catch (e) { console.error('❌ GET /horarios/reglas:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
