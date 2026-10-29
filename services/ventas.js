@@ -2498,6 +2498,18 @@ app.put('/leads-kommo-realzza/auditoria/leads/:id', async (req, res) => {
   } catch (e) { console.error('❌ PUT /leads-kommo-realzza/auditoria/leads/:id:', e); res.status(500).json({ success: false, message: 'No se pudo guardar la revisión.' }); }
 });
 
+// DELETE /leads-kommo-realzza/auditoria/leads/:id — quita un lead del lote (p.ej. si
+// quedó de más en un embudo tras sincronizar, o se sorteó por error).
+app.delete('/leads-kommo-realzza/auditoria/leads/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAuditoriaKommoSchema();
+    const { rowCount } = await pgPool.query(`DELETE FROM auditoria_kommo_leads WHERE id = $1`, [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'No encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /leads-kommo-realzza/auditoria/leads/:id:', e); res.status(500).json({ success: false, message: 'No se pudo eliminar.' }); }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 📊 MARGEN DE VENTAS (reemplazo por codigo_cv; uno-a-muchos por producto)
 // ─────────────────────────────────────────────────────────────────────────────
