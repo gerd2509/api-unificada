@@ -2882,8 +2882,10 @@ app.get('/reporte-global', async (req, res) => {
 // y "SEDE RELENOR MOTUPE") — el front manda exactamente los textos de sede que agregó en el
 // cuadro, así que el match es exacto (sin reimplementar la normalización de sede acá).
 // `entidad` vacío/omitido = sin entidad (LEONCITO o nula).
-// `entidad` (opcional, Aliados/Motos por sede): match exacto NULL-aware contra la columna.
-// `marca`/`tipo` (opcional, Motos por Marca/Tipo × sede): mismas CASE WHEN que
+// `entidad` (opcional): match exacto NULL-aware contra la columna. `soloMoto=1` (Motos
+// por Sede) agrega el mismo filtro estado_tipo_producto LIKE '%MOTO%' que usa la
+// agregación — si no, "Propio (Leoncito)" trae TODAS las ventas de esa entidad, no solo
+// las motos. `marca`/`tipo` (Motos por Marca/Tipo × sede): mismas CASE WHEN que
 // /reporte-global-motos, aplicadas como filtro — implican además "solo motos".
 app.get('/reporte-global-detalle', async (req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -2906,8 +2908,9 @@ app.get('/reporte-global-detalle', async (req, res) => {
     }
     const marca = req.query.marca ? String(req.query.marca).trim().toUpperCase() : '';
     const tipo = req.query.tipo ? String(req.query.tipo).trim().toUpperCase() : '';
+    const soloMoto = marca || tipo || req.query.soloMoto === '1';
+    if (soloMoto) cond.push(`UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'`);
     if (marca || tipo) {
-      cond.push(`UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'`);
       if (marca) {
         params.push(marca);
         cond.push(`(CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%WANXIN%' THEN 'WANXIN'
@@ -2926,6 +2929,7 @@ app.get('/reporte-global-detalle', async (req, res) => {
 
     const { rows } = await pgPool.query(`
       SELECT vendedor, cliente_venta AS cliente, productos AS producto,
+        COALESCE(NULLIF(TRIM(entidad),''), 'LEONCITO') AS entidad,
         ROUND(monto_consolidado)::int AS monto, dia_cv, mes_cv, anio_cv
       FROM ventas
       WHERE ${cond.join(' AND ')}
