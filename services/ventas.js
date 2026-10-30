@@ -2882,6 +2882,9 @@ app.get('/reporte-global', async (req, res) => {
 // y "SEDE RELENOR MOTUPE") — el front manda exactamente los textos de sede que agregó en el
 // cuadro, así que el match es exacto (sin reimplementar la normalización de sede acá).
 // `entidad` vacío/omitido = sin entidad (LEONCITO o nula).
+// `entidad` (opcional, Aliados/Motos por sede): match exacto NULL-aware contra la columna.
+// `marca`/`tipo` (opcional, Motos por Marca/Tipo × sede): mismas CASE WHEN que
+// /reporte-global-motos, aplicadas como filtro — implican además "solo motos".
 app.get('/reporte-global-detalle', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
@@ -2891,17 +2894,43 @@ app.get('/reporte-global-detalle', async (req, res) => {
     const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;
     const dia = req.query.dia ? parseInt(req.query.dia, 10) : 0;
     const sedes = String(req.query.sede || '').split(',').map(s => s.trim()).filter(Boolean);
-    const entidad = String(req.query.entidad || '').trim().toUpperCase();
     if (!sedes.length) return res.json([]);
+
+    const cond = ['monto_consolidado > 0', 'anio_cv = $1', '($2 = 0 OR mes_cv = $2)', '($3 = 0 OR dia_cv <= $3)', 'sede = ANY($4::text[])'];
+    const params = [anio, mes, dia, sedes];
+
+    if (req.query.entidad !== undefined) {
+      const entidad = String(req.query.entidad || '').trim().toUpperCase();
+      params.push(entidad);
+      cond.push(`NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') IS NOT DISTINCT FROM NULLIF($${params.length},'')`);
+    }
+    const marca = req.query.marca ? String(req.query.marca).trim().toUpperCase() : '';
+    const tipo = req.query.tipo ? String(req.query.tipo).trim().toUpperCase() : '';
+    if (marca || tipo) {
+      cond.push(`UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'`);
+      if (marca) {
+        params.push(marca);
+        cond.push(`(CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%WANXIN%' THEN 'WANXIN'
+                         WHEN UPPER(COALESCE(productos,'')) LIKE '%SSENDA%' THEN 'SSENDA'
+                         ELSE 'OTRAS' END) = $${params.length}`);
+      }
+      if (tipo) {
+        params.push(tipo);
+        cond.push(`(CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO DE CARGA%' THEN 'MOTO CARGUERA'
+                         WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%LINEAL%' THEN 'MOTO LINEAL'
+                         WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%TAXI%'
+                           OR UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO%' THEN 'MOTOTAXI'
+                         ELSE 'OTRO' END) = $${params.length}`);
+      }
+    }
+
     const { rows } = await pgPool.query(`
       SELECT vendedor, cliente_venta AS cliente, productos AS producto,
         ROUND(monto_consolidado)::int AS monto, dia_cv, mes_cv, anio_cv
       FROM ventas
-      WHERE monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-        AND sede = ANY($4::text[])
-        AND NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') IS NOT DISTINCT FROM NULLIF($5,'')
+      WHERE ${cond.join(' AND ')}
       ORDER BY anio_cv DESC, mes_cv DESC, dia_cv DESC, monto_consolidado DESC`,
-      [anio, mes, dia, sedes, entidad]);
+      params);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global-detalle:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
