@@ -1540,7 +1540,11 @@ app.post('/asistencia', async (req, res) => {
     }
     const precision = Number.isFinite(Number(b.precision)) ? Number(b.precision) : null;
     const u = req.usuario || {};
-    const sedeKey = (u.sede || '').toString().trim().toLowerCase();
+    // Patricia (cc_patricia) tiene su cuenta en sede "call" (sin coordenadas configuradas
+    // en cap_sedes), pero gestiona en Realzza Chiclayo — se fuerza esa sede SOLO para el
+    // cálculo de distancia de Asistencia, sin tocar su campo `sede` real de la cuenta.
+    const esPatriciaCall = (u.usuario || '').toString().trim().toLowerCase() === 'cc_patricia';
+    const sedeKey = esPatriciaCall ? 'realzzachiclayo' : (u.sede || '').toString().trim().toLowerCase();
 
     const { rows: sedeRows } = await pgPool.query(
       `SELECT nombre, latitud, longitud, radio_metros FROM cap_sedes
@@ -1549,6 +1553,21 @@ app.post('/asistencia', async (req, res) => {
     );
     const sedeInfo = sedeRows[0] || null;
     const sedeNombre = sedeInfo?.nombre || u.sede || '';
+
+    // Solo 1 marca por usuario por día (hora de Lima) — evita duplicados si el
+    // usuario le da varias veces al botón (recarga de página, doble clic, etc.).
+    const { rows: yaMarco } = await pgPool.query(
+      `SELECT creado_en FROM asistencia
+       WHERE usuario = $1 AND (creado_en AT TIME ZONE 'America/Lima')::date = (now() AT TIME ZONE 'America/Lima')::date
+       ORDER BY creado_en LIMIT 1`,
+      [u.usuario || '']
+    );
+    if (yaMarco.length) {
+      return res.status(409).json({
+        success: false, yaRegistrado: true,
+        message: 'Ya registraste tu asistencia hoy.', creadoEn: yaMarco[0].creado_en,
+      });
+    }
 
     let dist = null, dentroRango = null;
     const sinUbicacionConfigurada = !sedeInfo || sedeInfo.latitud == null || sedeInfo.longitud == null;
