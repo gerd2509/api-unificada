@@ -1552,7 +1552,10 @@ app.post('/asistencia', async (req, res) => {
       [sedeKey]
     );
     const sedeInfo = sedeRows[0] || null;
-    const sedeNombre = sedeInfo?.nombre || u.sede || '';
+    // El nombre que se guarda/muestra NO debe decir "Realzza" para Patricia (es Call
+    // Center, solo usa esas coordenadas para validar la distancia) — las coordenadas de
+    // sedeInfo (Realzza Chiclayo) se siguen usando igual más abajo.
+    const sedeNombre = esPatriciaCall ? 'CALL CENTER' : (sedeInfo?.nombre || u.sede || '');
 
     // Solo 1 marca por usuario por día (hora de Lima) — evita duplicados si el
     // usuario le da varias veces al botón (recarga de página, doble clic, etc.).
