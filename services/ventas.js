@@ -2858,19 +2858,39 @@ app.get('/reporte-global', async (req, res) => {
         SELECT sede,
           NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') AS entidad,
           (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto,
-          monto_consolidado, anio_cv, mes_cv, dia_cv
+          monto_consolidado, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af,
+          (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%') AS es_nc
         FROM ventas
+        WHERE monto_consolidado > 0 AND COALESCE(sede,'') <> ''
+      ),
+      bruto AS (
+        -- TODAS las ventas del periodo por su mes de VENTA (congelado), incluidas las que
+        -- ya son NC/incautación a valor pleno — es el universo "monto_bruto"/"ops_bruto".
+        SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops
+        FROM ent WHERE anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+        GROUP BY sede, entidad, es_moto
+      ),
+      nc AS (
+        -- NC/incautaciones que afectan el periodo por su propio mes de AFECTACIÓN: si la
+        -- NC es del mismo mes de la venta, netea exactamente esa venta (bruto − nc = 0 esa
+        -- fila); si es de un mes posterior, resta "arrastrada" sin tocar el mes de venta.
+        SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops
+        FROM ent WHERE es_nc AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
+        GROUP BY sede, entidad, es_moto
+      ),
+      claves AS (
+        SELECT sede, entidad, es_moto FROM bruto
+        UNION SELECT sede, entidad, es_moto FROM nc
       )
-      SELECT sede, entidad, es_moto,
-        ROUND(SUM(monto_consolidado))::int AS neto,
-        COUNT(*)::int AS ops,
-        ROUND(SUM(monto_consolidado))::int AS monto_bruto,
-        COUNT(*)::int AS ops_bruto
-      FROM ent
-      WHERE monto_consolidado > 0 AND anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-        AND COALESCE(sede,'') <> ''
-      GROUP BY sede, entidad, es_moto
-      ORDER BY sede, entidad`, [anio, mes, dia])).rows);
+      SELECT k.sede, k.entidad, k.es_moto,
+        ROUND(COALESCE(b.monto,0) - COALESCE(n.monto,0))::int AS neto,
+        (COALESCE(b.ops,0) - COALESCE(n.ops,0))::int AS ops,
+        ROUND(COALESCE(b.monto,0))::int AS monto_bruto,
+        COALESCE(b.ops,0)::int AS ops_bruto
+      FROM claves k
+      LEFT JOIN bruto b ON b.sede = k.sede AND b.entidad IS NOT DISTINCT FROM k.entidad AND b.es_moto = k.es_moto
+      LEFT JOIN nc    n ON n.sede = k.sede AND n.entidad IS NOT DISTINCT FROM k.entidad AND n.es_moto = k.es_moto
+      ORDER BY k.sede, k.entidad`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
@@ -2940,8 +2960,9 @@ app.get('/reporte-global-detalle', async (req, res) => {
 });
 
 // GET /reporte-global-motos?anio=&mes= → motos por (sede, credito, marca, tipo, vendedor),
-//   BRUTO por mes de venta tal cual el Excel importado (Carga Ventas) — sin restar notas
-//   de crédito/incautaciones de ningún mes. motos/motos_bruto quedan iguales.
+//   NETO por mes de venta (congelado) − NC/incautaciones de su propio mes de afectación
+//   (mismo criterio que /reporte-global y Ventas Campo). motos_bruto queda sin netear,
+//   para poder mostrar/exportar ambos.
 //   · credito: GLOBAL (entidad GLOBAL GO) / PROPIO (resto, principalmente LEONCITO).
 //   · marca:   WANXIN / SSENDA / OTRAS (según el texto del producto).
 //   · tipo:    MOTO CARGUERA (si el producto dice 'TRIMOTO DE CARGA'), MOTO LINEAL, MOTOTAXI.
@@ -2968,17 +2989,32 @@ app.get('/reporte-global-motos', async (req, res) => {
                  OR UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO%' THEN 'MOTOTAXI'
                ELSE 'OTRO' END AS tipo,
           COALESCE(NULLIF(TRIM(vendedor),''), '(sin vendedor)') AS vendedor,
-          sede, anio_cv, mes_cv, dia_cv
+          sede, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af,
+          (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%') AS es_nc
         FROM ventas
-        WHERE UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'
+        WHERE UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%' AND monto_consolidado > 0
+      ),
+      bruto AS (
+        SELECT sede, credito, marca, tipo, vendedor, COUNT(*) AS motos
+        FROM ent WHERE anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
+        GROUP BY sede, credito, marca, tipo, vendedor
+      ),
+      nc AS (
+        SELECT sede, credito, marca, tipo, vendedor, COUNT(*) AS motos
+        FROM ent WHERE es_nc AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
+        GROUP BY sede, credito, marca, tipo, vendedor
+      ),
+      claves AS (
+        SELECT sede, credito, marca, tipo, vendedor FROM bruto
+        UNION SELECT sede, credito, marca, tipo, vendedor FROM nc
       )
-      SELECT sede, credito, marca, tipo, vendedor,
-        COUNT(*)::int AS motos,
-        COUNT(*)::int AS motos_bruto
-      FROM ent
-      WHERE anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-      GROUP BY sede, credito, marca, tipo, vendedor
-      ORDER BY sede, motos_bruto DESC`, [anio, mes, dia])).rows);
+      SELECT k.sede, k.credito, k.marca, k.tipo, k.vendedor,
+        (COALESCE(b.motos,0) - COALESCE(n.motos,0))::int AS motos,
+        COALESCE(b.motos,0)::int AS motos_bruto
+      FROM claves k
+      LEFT JOIN bruto b ON b.sede=k.sede AND b.credito=k.credito AND b.marca=k.marca AND b.tipo=k.tipo AND b.vendedor=k.vendedor
+      LEFT JOIN nc    n ON n.sede=k.sede AND n.credito=k.credito AND n.marca=k.marca AND n.tipo=k.tipo AND n.vendedor=k.vendedor
+      ORDER BY k.sede, motos_bruto DESC`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global-motos:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
