@@ -1137,7 +1137,8 @@ app.get('/gestion-sedes-deriv', async (req, res) => {
     const { rows } = await pgPool.query(
       `SELECT id, to_char(${FECHA}, 'DD/MM/YYYY HH24:MI:SS') AS marca, sede,
               COALESCE(NULLIF(asesor_ferrenafe,''), asesor_lambayeque) AS asesor,
-              dni_cliente, celular_gestionado, tipo_base, tipo_cliente, producto_interes, motivo_interes,
+              dni_cliente, celular_gestionado, tipo_base, tipo_cliente, estado_gestion, resultado_gestion,
+              producto_interes, motivo_interes,
               fecha_interes_derivacion, hora_interes_derivacion, comentario_derivacion, origen
        FROM gestion_sedes_deriv ${where} ORDER BY ${FECHA} DESC`, params);
     res.json(rows);
