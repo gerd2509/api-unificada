@@ -1373,6 +1373,98 @@ app.delete('/productos-inventario/:id', async (req, res) => {
   } catch (e) { console.error('❌ DELETE /productos-inventario/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 💰 PAGO DE BONOS — bonos manuales (extra al bono calculado automáticamente de
+// Ventas Call / Ventas Realzza). Tipo libre (Bono Logístico, Bono Efectiva, Bono
+// Global Supervisor, u otro que se cree desde la pantalla); monto fijo que el
+// admin/gerente ingresa cada mes — no se calcula ni se repite solo.
+// ─────────────────────────────────────────────────────────────────────────────
+let bmSchemaLista = false;
+async function ensureBonosManualesSchema() {
+  if (!pgPool || bmSchemaLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS bonos_manuales (
+      id          BIGSERIAL PRIMARY KEY,
+      asesor      TEXT NOT NULL,
+      canal       TEXT NOT NULL,   -- CALL / REALZZA CHICLAYO / REALZZA PIURA / REALZZA LIMA
+      anio        SMALLINT NOT NULL,
+      mes         SMALLINT NOT NULL,
+      tipo        TEXT NOT NULL,   -- "Bono Logístico", "Bono Efectiva", "Bono Global Supervisor", ...
+      monto       NUMERIC(10,2) NOT NULL DEFAULT 0,
+      comentario  TEXT,
+      creado_por  TEXT,
+      creado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_bonos_manuales_periodo ON bonos_manuales (anio, mes, canal);
+  `);
+  bmSchemaLista = true;
+}
+
+// GET /bonos-manuales?anio=&mes=&canal= — lista del período (y canal, si se indica).
+app.get('/bonos-manuales', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureBonosManualesSchema();
+    const cond = [], params = [];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`anio = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`mes = $${params.length}`); }
+    if (req.query.canal) { params.push(String(req.query.canal)); cond.push(`canal = $${params.length}`); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    const { rows } = await pgPool.query(
+      `SELECT id, asesor, canal, anio, mes, tipo, monto, comentario, creado_por, creado_en
+       FROM bonos_manuales ${where} ORDER BY creado_en DESC`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /bonos-manuales:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// POST /bonos-manuales — crea un bono manual.
+app.post('/bonos-manuales', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const b = req.body || {};
+  if (!b.asesor || !b.canal || !b.anio || !b.mes || !b.tipo) {
+    return res.status(400).json({ success: false, message: 'Faltan campos obligatorios (asesor, canal, anio, mes, tipo).' });
+  }
+  try {
+    await ensureBonosManualesSchema();
+    const { rows } = await pgPool.query(
+      `INSERT INTO bonos_manuales (asesor, canal, anio, mes, tipo, monto, comentario, creado_por)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [String(b.asesor).trim(), String(b.canal).trim(), parseInt(b.anio, 10), parseInt(b.mes, 10),
+       String(b.tipo).trim(), Number(b.monto) || 0, b.comentario ? String(b.comentario).trim() : null,
+       b.creado_por ? String(b.creado_por).trim() : null]);
+    res.json({ success: true, id: rows[0].id });
+  } catch (e) { console.error('❌ POST /bonos-manuales:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// PUT /bonos-manuales/:id — edita tipo/monto/comentario.
+app.put('/bonos-manuales/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureBonosManualesSchema();
+    const b = req.body || {};
+    const sets = [], vals = [];
+    if (b.tipo !== undefined) { vals.push(String(b.tipo).trim()); sets.push(`tipo = $${vals.length}`); }
+    if (b.monto !== undefined) { vals.push(Number(b.monto) || 0); sets.push(`monto = $${vals.length}`); }
+    if (b.comentario !== undefined) { vals.push(b.comentario ? String(b.comentario).trim() : null); sets.push(`comentario = $${vals.length}`); }
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    vals.push(parseInt(req.params.id, 10));
+    const { rowCount } = await pgPool.query(`UPDATE bonos_manuales SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Bono no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /bonos-manuales/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// DELETE /bonos-manuales/:id
+app.delete('/bonos-manuales/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureBonosManualesSchema();
+    const { rowCount } = await pgPool.query('DELETE FROM bonos_manuales WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Bono no encontrado.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /bonos-manuales/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
   ok: true, service: 'gestion-service', db: !!pgPool, ts: new Date().toISOString(),
