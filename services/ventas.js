@@ -1997,15 +1997,30 @@ async function kommoConcurrente(items, limite, trabajador) {
 // Trae TODOS los leads que cumplan el filtro dado (query string de /api/v4/leads),
 // paginando por ventanas de 5 páginas en paralelo hasta agotar resultados (una
 // cuenta con decenas de miles de leads sería demasiado lenta pidiendo de a una).
+// Kommo responde 204 (sin cuerpo) en la página siguiente a la última — kommoFetch
+// devuelve null en ese caso, y ESO sí marca el final real de la paginación. Una
+// página que falla (red caída, error tras agotar reintentos) es otra cosa: si se
+// tratara igual que un 204, un solo fallo transitorio cortaría la sincronización
+// ahí mismo y, como se pagina ordenando por updated_at desc, TODOS los leads más
+// antiguos que esa página (incluido cualquiera que un asesor acabe de responder)
+// quedarían sin traer — y como el próximo sync solo mira hacia adelante desde
+// "ahora", jamás se recuperarían. Por eso una página fallida se marca aparte y NO
+// corta el bucle: se pierde solo esa página puntual, pero se sigue agotando el
+// resto de las páginas reales.
 async function kommoListarLeadsPorFiltro(filtroQS) {
+  const FALLO = Symbol('fallo');
   const leads = [];
   const VENTANA = 3;
   for (let base = 1; base <= 300; base += VENTANA) {
     const paginas = Array.from({ length: VENTANA }, (_, i) => base + i);
     const resultados = await kommoConcurrente(paginas, VENTANA, p =>
-      kommoFetch(`/api/v4/leads?${filtroQS}&with=contacts&limit=250&page=${p}`).catch(() => null));
+      kommoFetch(`/api/v4/leads?${filtroQS}&with=contacts&limit=250&page=${p}`).catch(e => {
+        console.error(`⚠️ Kommo: falló la página ${p} de la sincronización, se reintentará en la próxima corrida:`, e.message);
+        return FALLO;
+      }));
     let terminado = false;
     for (const data of resultados) {
+      if (data === FALLO) continue;
       const lote = data?._embedded?.leads || [];
       leads.push(...lote);
       if (!data || lote.length < 250) terminado = true;
