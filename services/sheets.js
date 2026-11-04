@@ -29,6 +29,9 @@ app.use(crearRequireAuth([
 const pgPool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
+// Sin este listener, un cliente IDLE del pool al que Supabase le corta la conexión dispara
+// un 'error' no manejado que TUMBA TODO EL PROCESO (ver mismo fix en services/ventas.js).
+if (pgPool) pgPool.on('error', (err) => console.error('⚠️ pgPool (sheets) error en cliente idle:', err.message));
 
 // 📤 Subida de archivos en memoria (para el Excel de ventas). Límite 200 MB.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });

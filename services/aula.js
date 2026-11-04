@@ -26,6 +26,9 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 
 const pgPool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
+// Sin este listener, un cliente IDLE del pool al que Supabase le corta la conexión dispara
+// un 'error' no manejado que TUMBA TODO EL PROCESO (ver mismo fix en services/ventas.js).
+if (pgPool) pgPool.on('error', (err) => console.error('⚠️ pgPool (aula) error en cliente idle:', err.message));
 
 // ── Supabase Storage (PDFs del aula, bucket privado) — mismo patrón que gestion.js ──
 const SB_URL = process.env.SUPABASE_URL || '';

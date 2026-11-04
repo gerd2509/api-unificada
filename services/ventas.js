@@ -31,6 +31,11 @@ app.use(crearRequireAuth());   // todas las rutas de este servicio exigen sesió
 const pgPool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
+// Sin este listener, un cliente IDLE del pool al que Supabase le corta la conexión (muy
+// normal, pasa solo) dispara un 'error' no manejado que TUMBA TODO EL PROCESO (Node trata
+// un 'error' de EventEmitter sin listener como excepción no capturada) — se llevaba de paso
+// TODOS los módulos, no solo ventas. Logueamos y seguimos; pg-pool reemplaza el cliente solo.
+if (pgPool) pgPool.on('error', (err) => console.error('⚠️ pgPool (ventas) error en cliente idle:', err.message));
 
 // 🗃️ Caché en memoria de queries de LECTURA pesadas (p. ej. /ventas trae ~16k filas
 // del año, iguales para todos los usuarios). La 1ª petición va a Postgres/Supabase y
@@ -205,6 +210,13 @@ async function ensureVentasSchema() {
   `);
   ventasSchemaLista = true;
 }
+// Se ejecuta UNA sola vez al arrancar (igual que ensurePerfIndexes), en vez de esperar a la
+// primera petición: este DDL (CREATE INDEX/ALTER TABLE, aunque sean IF NOT EXISTS) necesita
+// un lock que choca con una carga de ventas en curso (que mantiene bloqueos varios minutos
+// mientras hace upsert de miles de filas) — si eso pasa durante una petición real, el DDL
+// se queda esperando el lock y termina cancelado por "statement timeout" (2 min), tumbando
+// /ventas/import y /ventas/estado justo cuando el usuario está subiendo un archivo.
+ensureVentasSchema().catch(e => console.error('⚠️ ensureVentasSchema inicial:', e.message));
 
 // Convierte una fila cruda del Excel al arreglo ordenado según VENTAS_COLS.
 function mapVentaRow(r) {
@@ -778,7 +790,9 @@ const DERIV_LATERAL = `
 //   atrib_tipo_cliente = tipo de cliente de la gestión (BRILLA, VIGENTE, …) — editable
 //   atrib_tipo_base    = por defecto = tipo_cliente — editable
 //   asesor_manual      = fila protegida del re-cruce (se editó a mano)
+let ventasAtribLista = false;
 async function ensureAtribVentas() {
+  if (ventasAtribLista) return;
   await ensureVentasSchema();
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS asesor_venta       TEXT`);
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_contacto     TEXT`);
@@ -788,7 +802,12 @@ async function ensureAtribVentas() {
   // Marca manual "extranjero" (carnet de extranjería): la venta nunca cruza por DNI,
   // pero al marcarla sí cuenta al avance del vendedor aunque sea sin derivación.
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_extranjero   BOOLEAN NOT NULL DEFAULT false`);
+  ventasAtribLista = true;
 }
+// Una sola vez al arrancar — mismo motivo que ensureVentasSchema: este DDL repetido en
+// cada petición (/ventas-call/cruzar, /buscar, /atribucion) podía chocar con los locks de
+// una carga de ventas en curso y colgarse hasta el statement timeout.
+ensureAtribVentas().catch(e => console.error('⚠️ ensureAtribVentas inicial:', e.message));
 // Columnas comunes que devuelven los endpoints de atribución (con las columnas del Excel Call).
 // Los campos atribuidos muestran el valor EFECTIVO: lo guardado (o editado a mano)
 // y, si aún no se cruzó, la sugerencia de la derivación (el CC y el TipoCliente que

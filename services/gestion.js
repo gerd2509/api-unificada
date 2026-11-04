@@ -29,6 +29,9 @@ const TOKEN_SERVICIO = firmarTokenServicio();
 const pgPool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
+// Sin este listener, un cliente IDLE del pool al que Supabase le corta la conexión dispara
+// un 'error' no manejado que TUMBA TODO EL PROCESO (ver mismo fix en services/ventas.js).
+if (pgPool) pgPool.on('error', (err) => console.error('⚠️ pgPool (gestion) error en cliente idle:', err.message));
 
 // ── Helpers compartidos (portados idénticos del monolito) ────────────────────
 // Fecha/hora actual en America/Lima como string (no se convierte a UTC al insertar).
