@@ -2105,88 +2105,116 @@ function registrarLeads(canal, ruta) {
   // Esta cuenta de Kommo es SOLO de Realzza — Call tiene su propia cuenta de Kommo
   // aparte (no esta) y sigue 100% con el Excel manual, sin tocar.
   if (canal === 'realzza') {
-  // POST /{ruta}/sync-kommo?anio=&mes=&completo= — trae DIRECTO de la API de Kommo
-  // solo lo que cambió desde la última sincronización (sin importar el mes en que
-  // fue creado el lead, para que una etiqueta o respuesta tardía también se
-  // refresque), guardando cada corrida como marca de tiempo para la próxima. Con
-  // ?completo=1 (o si nunca se sincronizó) trae la cuenta completa — útil como
-  // refresco total de vez en cuando. anio/mes solo quedan para identificar la carga
-  // en el historial. Guarda ID, nombre del cliente, embudo, estado, fechas y quién
-  // modificó por última vez (para saber si está respondido) en la misma tabla que
-  // ya usan Maduración de Leads y Embudos.
+  // Una cuenta con decenas de miles de leads puede tardar varios MINUTOS en traerse
+  // completa de Kommo — demasiado para que una sola petición HTTP la espere (Render/
+  // Cloudflare la cortan mucho antes, y el navegador se queda "cargando" para
+  // siempre sin saberlo). Por eso el POST de abajo solo DISPARA el trabajo y
+  // responde al toque; el trabajo real corre en segundo plano y el front consulta
+  // su avance con GET /sync-kommo/estado (polling) en vez de esperar la respuesta.
+  let kommoSyncEstado = { enProgreso: false, inicio: null, resultado: null, error: null };
+
+  async function ejecutarSyncKommo(anio, mes, completo, cargadoPor) {
+    const ahoraUnix = Math.floor(Date.now() / 1000);
+    const MARGEN_SEG = 5 * 60; // margen por si el reloj o el proceso anterior se demoró
+    const ultimoSyncUnix = completo ? 0 : await kommoUltimoSyncUnix(c);
+    const desdeUnix = ultimoSyncUnix ? Math.max(0, ultimoSyncUnix - MARGEN_SEG) : null;
+
+    const [leads, mapas] = await Promise.all([kommoListarLeads(desdeUnix, ahoraUnix), kommoMapas()]);
+    const rows = leads.map(l => {
+      const creado = kommoFechaLima(l.created_at);
+      const modificado = kommoFechaLima(l.updated_at);
+      const tags = (l._embedded?.tags || []).map(t => t.name).join(', ');
+      return [
+        l.id,
+        l.name || `Lead #${l.id}`,
+        '',
+        mapas.usuarios.get(l.responsible_user_id) || '',
+        mapas.embudos.get(l.pipeline_id) || '',
+        creado.d, creado.m, creado.y,
+        modificado.raw,
+        l.updated_by ? (mapas.usuarios.get(l.updated_by) || '') : '',
+        tags,
+        l._nombreContacto,
+        mapas.estados.get(l.status_id) || '',
+        l.pipeline_id || null,
+        l.status_id || null,
+        l.responsible_user_id || null,
+      ];
+    });
+
+    let insertados = 0, actualizados = 0;
+    const client = await pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      const CHUNK = 500;
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        const r = await upsertLeadsChunk(client, c.tabla, rows.slice(i, i + CHUNK));
+        insertados += r.inserted; actualizados += r.updated;
+      }
+      // Renombrar un embudo/estado/asesor en Kommo NO toca el updated_at de cada
+      // lead dentro de él, así que un sync incremental nunca los vuelve a traer.
+      // Por eso, SIEMPRE (con o sin leads nuevos) se refresca el texto de TODOS
+      // los leads ya guardados contra el mapa de nombres recién pedido, por ID.
+      const remapear = async (columna, idCol, mapa) => {
+        if (!mapa.size) return;
+        await client.query(
+          `UPDATE ${c.tabla} AS t SET ${columna} = m.nombre
+           FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::text[]) AS nombre) AS m
+           WHERE t.${idCol} = m.id AND t.${columna} IS DISTINCT FROM m.nombre`,
+          [[...mapa.keys()], [...mapa.values()]]);
+      };
+      await remapear('embudo', 'pipeline_id', mapas.embudos);
+      await remapear('estado', 'status_id', mapas.estados);
+      await remapear('responsable', 'responsible_user_id', mapas.usuarios);
+      // Se registra SIEMPRE (incluso con 0 filas) con el momento en que arrancó
+      // este sync como marca de tiempo — así el próximo sync incremental sabe
+      // desde dónde partir, sin importar si hubo cambios esta vez o no.
+      await client.query(
+        `INSERT INTO ${c.cargas} (cargado_por, archivo, filas, insertados, actualizados, creado_en) VALUES ($1,$2,$3,$4,$5, to_timestamp($6))`,
+        [cargadoPor, `Kommo API ${anio}-${String(mes).padStart(2, '0')}${desdeUnix ? ' (incremental)' : ' (completo)'}`, rows.length, insertados, actualizados, ahoraUnix]);
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    return { filas: rows.length, insertados, actualizados, incremental: !!desdeUnix };
+  }
+
+  // POST /{ruta}/sync-kommo?anio=&mes=&completo= — DISPARA la sincronización en
+  // segundo plano y responde de inmediato (no espera a que termine). Sin
+  // ?completo=1 trae solo lo que cambió desde la última corrida (sin importar el
+  // mes en que fue creado el lead, para que una respuesta tardía en un lead viejo
+  // también se refresque); con completo=1 (o si nunca se sincronizó) trae la cuenta
+  // entera — tarda minutos en una cuenta grande, por eso el front debe consultar
+  // GET /sync-kommo/estado en vez de esperar esta respuesta.
   app.post(`/${ruta}/sync-kommo`, async (req, res) => {
     if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    if (kommoSyncEstado.enProgreso) {
+      return res.status(409).json({ success: false, message: 'Ya hay una sincronización en curso, espera a que termine.' });
+    }
     try {
+      await ensureLeadsSchema(canal);
       const hoy = new Date();
       const anio = parseInt(req.query.anio, 10) || hoy.getFullYear();
       const mes = parseInt(req.query.mes, 10) || (hoy.getMonth() + 1);
+      const completo = !!req.query.completo;
+      const cargadoPor = toStr(req.body && req.body.cargado_por) || 'Sincronización Kommo API';
 
-      await ensureLeadsSchema(canal);
-      const ahoraUnix = Math.floor(Date.now() / 1000);
-      const MARGEN_SEG = 5 * 60; // margen por si el reloj o el proceso anterior se demoró
-      const ultimoSyncUnix = req.query.completo ? 0 : await kommoUltimoSyncUnix(c);
-      const desdeUnix = ultimoSyncUnix ? Math.max(0, ultimoSyncUnix - MARGEN_SEG) : null;
+      kommoSyncEstado = { enProgreso: true, inicio: new Date().toISOString(), resultado: null, error: null };
+      ejecutarSyncKommo(anio, mes, completo, cargadoPor)
+        .then(resultado => { kommoSyncEstado = { enProgreso: false, inicio: kommoSyncEstado.inicio, resultado, error: null }; })
+        .catch(e => {
+          console.error(`❌ Sincronización en segundo plano /${ruta}/sync-kommo:`, e);
+          kommoSyncEstado = { enProgreso: false, inicio: kommoSyncEstado.inicio, resultado: null, error: e.message || 'Error desconocido.' };
+        });
 
-      const [leads, mapas] = await Promise.all([kommoListarLeads(desdeUnix, ahoraUnix), kommoMapas()]);
-      const rows = leads.map(l => {
-        const creado = kommoFechaLima(l.created_at);
-        const modificado = kommoFechaLima(l.updated_at);
-        const tags = (l._embedded?.tags || []).map(t => t.name).join(', ');
-        return [
-          l.id,
-          l.name || `Lead #${l.id}`,
-          '',
-          mapas.usuarios.get(l.responsible_user_id) || '',
-          mapas.embudos.get(l.pipeline_id) || '',
-          creado.d, creado.m, creado.y,
-          modificado.raw,
-          l.updated_by ? (mapas.usuarios.get(l.updated_by) || '') : '',
-          tags,
-          l._nombreContacto,
-          mapas.estados.get(l.status_id) || '',
-          l.pipeline_id || null,
-          l.status_id || null,
-          l.responsible_user_id || null,
-        ];
-      });
-
-      let insertados = 0, actualizados = 0;
-      const client = await pgPool.connect();
-      try {
-        await client.query('BEGIN');
-        const CHUNK = 500;
-        for (let i = 0; i < rows.length; i += CHUNK) {
-          const r = await upsertLeadsChunk(client, c.tabla, rows.slice(i, i + CHUNK));
-          insertados += r.inserted; actualizados += r.updated;
-        }
-        // Renombrar un embudo/estado/asesor en Kommo NO toca el updated_at de cada
-        // lead dentro de él, así que un sync incremental nunca los vuelve a traer.
-        // Por eso, SIEMPRE (con o sin leads nuevos) se refresca el texto de TODOS
-        // los leads ya guardados contra el mapa de nombres recién pedido, por ID.
-        const remapear = async (columna, idCol, mapa) => {
-          if (!mapa.size) return;
-          await client.query(
-            `UPDATE ${c.tabla} AS t SET ${columna} = m.nombre
-             FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::text[]) AS nombre) AS m
-             WHERE t.${idCol} = m.id AND t.${columna} IS DISTINCT FROM m.nombre`,
-            [[...mapa.keys()], [...mapa.values()]]);
-        };
-        await remapear('embudo', 'pipeline_id', mapas.embudos);
-        await remapear('estado', 'status_id', mapas.estados);
-        await remapear('responsable', 'responsible_user_id', mapas.usuarios);
-        // Se registra SIEMPRE (incluso con 0 filas) con el momento en que arrancó
-        // este sync como marca de tiempo — así el próximo sync incremental sabe
-        // desde dónde partir, sin importar si hubo cambios esta vez o no.
-        await client.query(
-          `INSERT INTO ${c.cargas} (cargado_por, archivo, filas, insertados, actualizados, creado_en) VALUES ($1,$2,$3,$4,$5, to_timestamp($6))`,
-          [toStr(req.body && req.body.cargado_por) || 'Sincronización Kommo API', `Kommo API ${anio}-${String(mes).padStart(2, '0')}${desdeUnix ? ' (incremental)' : ' (completo)'}`, rows.length, insertados, actualizados, ahoraUnix]);
-        await client.query('COMMIT');
-      } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-      res.json({ success: true, filas: rows.length, insertados, actualizados, incremental: !!desdeUnix, updated_at: new Date().toISOString() });
+      res.json({ success: true, iniciado: true, message: 'Sincronización iniciada en segundo plano.' });
     } catch (error) {
       console.error(`❌ Error en POST /${ruta}/sync-kommo:`, error);
-      res.status(500).json({ success: false, message: 'Error interno del servidor.' || 'No se pudo sincronizar con Kommo.' });
+      res.status(500).json({ success: false, message: 'No se pudo iniciar la sincronización.' });
     }
+  });
+  // GET /{ruta}/sync-kommo/estado — para que el front haga polling del avance de la
+  // sincronización en segundo plano en vez de esperar colgado la respuesta del POST.
+  app.get(`/${ruta}/sync-kommo/estado`, (req, res) => {
+    res.json({ success: true, ...kommoSyncEstado });
   });
   // GET /{ruta}/listado?anio=&mes=&tienda= — listado de leads (ID, nombre del
   // cliente, embudo, estado, fechas, quién modificó) para ver de un vistazo si cada
