@@ -2007,27 +2007,34 @@ async function kommoConcurrente(items, limite, trabajador) {
 // "ahora", jamás se recuperarían. Por eso una página fallida se marca aparte y NO
 // corta el bucle: se pierde solo esa página puntual, pero se sigue agotando el
 // resto de las páginas reales.
-async function kommoListarLeadsPorFiltro(filtroQS) {
+// `onLote(leadsDeEsaPagina)` se llama apenas cada página llega (no al final con
+// todo junto): como Kommo ordena por updated_at desc, los leads más recientes
+// (los que más importa ver "ya respondidos" — el mes actual, lo que un asesor
+// contestó hoy) quedan guardados en la base dentro de los primeros segundos,
+// mientras el resto de la cuenta se sigue trayendo por detrás. Es lo mismo
+// trabajo de siempre, solo que "por etapas" en vez de esperar a juntarlo todo.
+async function kommoListarLeadsPorFiltro(filtroQS, onLote) {
   const FALLO = Symbol('fallo');
-  const leads = [];
   const VENTANA = 3;
   for (let base = 1; base <= 300; base += VENTANA) {
     const paginas = Array.from({ length: VENTANA }, (_, i) => base + i);
-    const resultados = await kommoConcurrente(paginas, VENTANA, p =>
-      kommoFetch(`/api/v4/leads?${filtroQS}&with=contacts&limit=250&page=${p}`).catch(e => {
+    const resultados = await kommoConcurrente(paginas, VENTANA, async p => {
+      const data = await kommoFetch(`/api/v4/leads?${filtroQS}&with=contacts&limit=250&page=${p}`).catch(e => {
         console.error(`⚠️ Kommo: falló la página ${p} de la sincronización, se reintentará en la próxima corrida:`, e.message);
         return FALLO;
-      }));
+      });
+      const lote = data !== FALLO ? (data?._embedded?.leads || []) : [];
+      if (lote.length) await onLote(lote);
+      return data;
+    });
     let terminado = false;
     for (const data of resultados) {
       if (data === FALLO) continue;
       const lote = data?._embedded?.leads || [];
-      leads.push(...lote);
       if (!data || lote.length < 250) terminado = true;
     }
     if (terminado) break;
   }
-  return leads;
 }
 // Resuelve el nombre real del cliente (contacto principal) en lotes de /api/v4/contacts
 // (5 lotes en paralelo a la vez) y lo agrega como _nombreContacto en cada lead.
@@ -2046,18 +2053,19 @@ async function kommoResolverNombresContacto(leads) {
 // Si se pasa [desdeUnix, hastaUnix] trae SOLO los leads con actividad en ese rango
 // (sin importar cuándo fueron creados — así un lead viejo con una etiqueta o
 // respuesta nueva se refresca igual). Sin rango, trae la cuenta completa (primer
-// sync, o cuando se pide forzar un refresco total).
-async function kommoListarLeads(desdeUnix, hastaUnix) {
+// sync, o cuando se pide forzar un refresco total). `onLote` recibe cada página ya
+// con el nombre del contacto resuelto, lista para guardar — paginar ordenando por
+// updated_at en una cuenta con actividad constante puede repetir un lead en dos
+// páginas si se reordena justo entre pedidos, pero guardarlo dos veces es
+// inofensivo (es un upsert), así que ya no hace falta juntar todo para deduplicar.
+async function kommoListarLeads(desdeUnix, hastaUnix, onLote) {
   const filtro = desdeUnix
     ? `filter[updated_at][from]=${desdeUnix}&filter[updated_at][to]=${hastaUnix}&order[updated_at]=desc`
     : 'order[updated_at]=desc';
-  const todos = await kommoListarLeadsPorFiltro(filtro);
-  // Paginar ordenando por updated_at en una cuenta con actividad constante puede
-  // repetir un lead en dos páginas si se reordena justo entre pedidos — se
-  // deduplica por ID antes de armar las filas a insertar.
-  const porId = new Map();
-  for (const l of todos) porId.set(l.id, l);
-  return kommoResolverNombresContacto([...porId.values()]);
+  await kommoListarLeadsPorFiltro(filtro, async (lote) => {
+    const conNombres = await kommoResolverNombresContacto(lote);
+    await onLote(conNombres);
+  });
 }
 // Timestamp (unix) de la última sincronización CONTRA LA API de Kommo (no cuenta
 // las subidas manuales de Excel) — se usa como punto de partida para traer solo lo
@@ -2113,48 +2121,64 @@ function registrarLeads(canal, ruta) {
   // su avance con GET /sync-kommo/estado (polling) en vez de esperar la respuesta.
   let kommoSyncEstado = { enProgreso: false, inicio: null, resultado: null, error: null };
 
+  // Guarda cada página apenas llega (ver kommoListarLeadsPorFiltro) en vez de
+  // esperar a tener TODA la cuenta en memoria para recién ahí escribir en la base.
+  // Dos ventajas: (1) como Kommo entrega lo más reciente primero, el mes actual —
+  // lo que de verdad importa para saber quién ya respondió — queda guardado y
+  // visible dentro de los primeros segundos, aunque el resto de la cuenta siga
+  // trayéndose por detrás; (2) cada lote es su propio upsert corto, sin mantener
+  // una sola transacción abierta por varios minutos esperando a Kommo entre medio
+  // (el mismo problema de locks/statement_timeout que ya tuvimos con las
+  // importaciones largas de ventas).
   async function ejecutarSyncKommo(anio, mes, completo, cargadoPor) {
     const ahoraUnix = Math.floor(Date.now() / 1000);
     const MARGEN_SEG = 5 * 60; // margen por si el reloj o el proceso anterior se demoró
     const ultimoSyncUnix = completo ? 0 : await kommoUltimoSyncUnix(c);
     const desdeUnix = ultimoSyncUnix ? Math.max(0, ultimoSyncUnix - MARGEN_SEG) : null;
 
-    const [leads, mapas] = await Promise.all([kommoListarLeads(desdeUnix, ahoraUnix), kommoMapas()]);
-    const rows = leads.map(l => {
-      const creado = kommoFechaLima(l.created_at);
-      const modificado = kommoFechaLima(l.updated_at);
-      const tags = (l._embedded?.tags || []).map(t => t.name).join(', ');
-      return [
-        l.id,
-        l.name || `Lead #${l.id}`,
-        '',
-        mapas.usuarios.get(l.responsible_user_id) || '',
-        mapas.embudos.get(l.pipeline_id) || '',
-        creado.d, creado.m, creado.y,
-        modificado.raw,
-        l.updated_by ? (mapas.usuarios.get(l.updated_by) || '') : '',
-        tags,
-        l._nombreContacto,
-        mapas.estados.get(l.status_id) || '',
-        l.pipeline_id || null,
-        l.status_id || null,
-        l.responsible_user_id || null,
-      ];
+    const mapas = await kommoMapas();
+    let totalFilas = 0, insertados = 0, actualizados = 0;
+
+    await kommoListarLeads(desdeUnix, ahoraUnix, async (lote) => {
+      const rows = lote.map(l => {
+        const creado = kommoFechaLima(l.created_at);
+        const modificado = kommoFechaLima(l.updated_at);
+        const tags = (l._embedded?.tags || []).map(t => t.name).join(', ');
+        return [
+          l.id,
+          l.name || `Lead #${l.id}`,
+          '',
+          mapas.usuarios.get(l.responsible_user_id) || '',
+          mapas.embudos.get(l.pipeline_id) || '',
+          creado.d, creado.m, creado.y,
+          modificado.raw,
+          l.updated_by ? (mapas.usuarios.get(l.updated_by) || '') : '',
+          tags,
+          l._nombreContacto,
+          mapas.estados.get(l.status_id) || '',
+          l.pipeline_id || null,
+          l.status_id || null,
+          l.responsible_user_id || null,
+        ];
+      });
+      const client = await pgPool.connect();
+      try {
+        const r = await upsertLeadsChunk(client, c.tabla, rows);
+        insertados += r.inserted; actualizados += r.updated;
+      } finally { client.release(); }
+      totalFilas += rows.length;
+      // El front hace polling de esto: así ve el avance en vivo (filas/insertados/
+      // actualizados subiendo) en vez de solo "en progreso" a ciegas por minutos.
+      kommoSyncEstado = { ...kommoSyncEstado, resultado: { filas: totalFilas, insertados, actualizados, incremental: !!desdeUnix } };
     });
 
-    let insertados = 0, actualizados = 0;
+    // Renombrar un embudo/estado/asesor en Kommo NO toca el updated_at de cada
+    // lead dentro de él, así que un sync incremental nunca los vuelve a traer.
+    // Por eso, SIEMPRE (con o sin leads nuevos) se refresca el texto de TODOS los
+    // leads ya guardados contra el mapa de nombres recién pedido, por ID — una
+    // sola vez al final, no por lote (es una pasada sobre la tabla entera).
     const client = await pgPool.connect();
     try {
-      await client.query('BEGIN');
-      const CHUNK = 500;
-      for (let i = 0; i < rows.length; i += CHUNK) {
-        const r = await upsertLeadsChunk(client, c.tabla, rows.slice(i, i + CHUNK));
-        insertados += r.inserted; actualizados += r.updated;
-      }
-      // Renombrar un embudo/estado/asesor en Kommo NO toca el updated_at de cada
-      // lead dentro de él, así que un sync incremental nunca los vuelve a traer.
-      // Por eso, SIEMPRE (con o sin leads nuevos) se refresca el texto de TODOS
-      // los leads ya guardados contra el mapa de nombres recién pedido, por ID.
       const remapear = async (columna, idCol, mapa) => {
         if (!mapa.size) return;
         await client.query(
@@ -2171,10 +2195,9 @@ function registrarLeads(canal, ruta) {
       // desde dónde partir, sin importar si hubo cambios esta vez o no.
       await client.query(
         `INSERT INTO ${c.cargas} (cargado_por, archivo, filas, insertados, actualizados, creado_en) VALUES ($1,$2,$3,$4,$5, to_timestamp($6))`,
-        [cargadoPor, `Kommo API ${anio}-${String(mes).padStart(2, '0')}${desdeUnix ? ' (incremental)' : ' (completo)'}`, rows.length, insertados, actualizados, ahoraUnix]);
-      await client.query('COMMIT');
-    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-    return { filas: rows.length, insertados, actualizados, incremental: !!desdeUnix };
+        [cargadoPor, `Kommo API ${anio}-${String(mes).padStart(2, '0')}${desdeUnix ? ' (incremental)' : ' (completo)'}`, totalFilas, insertados, actualizados, ahoraUnix]);
+    } finally { client.release(); }
+    return { filas: totalFilas, insertados, actualizados, incremental: !!desdeUnix };
   }
 
   // POST /{ruta}/sync-kommo?anio=&mes=&completo= — DISPARA la sincronización en
