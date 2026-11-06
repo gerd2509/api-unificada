@@ -3350,6 +3350,147 @@ app.put('/metas-avance', async (req, res) => {
   } catch (e) { console.error('❌ PUT /metas-avance:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
+// ── Concreción de Cartera por Sede (módulo nuevo) ────────────────────────────
+// Guarda, mes a mes, la "base asignada" que se sube por Excel (misma cartera que
+// Comparativo Cartera vs Ventas, pero PERSISTIDA) para poder ver la evolución de
+// varios meses sin volver a subir el archivo cada vez. El cruce cartera↔ventas
+// (quién convirtió, por sede) sigue haciéndose en el navegador, igual que en ese
+// módulo; aquí solo se guarda la base y, una vez calculado el resultado de un mes
+// que ya quedó en el pasado, se CONGELA (snapshot) para que una Nota de Crédito o
+// incautación posterior no le cambie el número a un mes que ya cerró.
+let carteraMensualLista = false;
+async function ensureCarteraMensualSchema() {
+  if (!pgPool || carteraMensualLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS cartera_mensual (
+      id           BIGSERIAL PRIMARY KEY,
+      anio         INT  NOT NULL,
+      mes          INT  NOT NULL,
+      dni          TEXT NOT NULL,
+      vendedor     TEXT NOT NULL DEFAULT '',
+      tipo_base    TEXT NOT NULL DEFAULT '',
+      tipo_cliente TEXT NOT NULL DEFAULT '',
+      sede         TEXT NOT NULL DEFAULT '',
+      cargado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_cartera_mensual_mes ON cartera_mensual (anio, mes);
+    CREATE TABLE IF NOT EXISTS cartera_mensual_snapshot (
+      id           BIGSERIAL PRIMARY KEY,
+      anio         INT NOT NULL,
+      mes          INT NOT NULL,
+      sede         TEXT NOT NULL,
+      asignados    INT NOT NULL DEFAULT 0,
+      vendidos     INT NOT NULL DEFAULT 0,
+      monto        NUMERIC(14,2) NOT NULL DEFAULT 0,
+      congelado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (anio, mes, sede)
+    );
+  `);
+  carteraMensualLista = true;
+}
+
+// GET /cartera-mensual/meses → [{anio, mes}] con base cargada, para el selector.
+app.get('/cartera-mensual/meses', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCarteraMensualSchema();
+    const { rows } = await pgPool.query(`SELECT DISTINCT anio, mes FROM cartera_mensual ORDER BY anio, mes`);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /cartera-mensual/meses:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// GET /cartera-mensual?anio=&mes= → filas de la base asignada ese mes (para cruzar con ventas).
+app.get('/cartera-mensual', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const anio = parseInt(req.query.anio, 10);
+  const mes = parseInt(req.query.mes, 10);
+  if (!anio || !mes) return res.status(400).json({ success: false, message: 'Faltan anio/mes.' });
+  try {
+    await ensureCarteraMensualSchema();
+    const { rows } = await pgPool.query(
+      `SELECT dni, vendedor, tipo_base AS "tipoBase", tipo_cliente AS "tipoCliente", sede
+         FROM cartera_mensual WHERE anio = $1 AND mes = $2`, [anio, mes]);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /cartera-mensual:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// POST /cartera-mensual/import { anio, mes, filas:[{dni,vendedor,tipoBase,tipoCliente,sede}] }
+// Reemplaza TODA la base de ese mes (volver a subir el Excel = reemplazo, no se acumula).
+app.post('/cartera-mensual/import', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const anio = parseInt(req.body?.anio, 10);
+  const mes = parseInt(req.body?.mes, 10);
+  const filas = Array.isArray(req.body?.filas) ? req.body.filas : [];
+  if (!anio || !mes) return res.status(400).json({ success: false, message: 'Faltan anio/mes.' });
+  if (!filas.length) return res.status(400).json({ success: false, message: 'El archivo no tiene filas válidas.' });
+  const COLS = ['anio', 'mes', 'dni', 'vendedor', 'tipo_base', 'tipo_cliente', 'sede'];
+  const client = await pgPool.connect();
+  try {
+    await ensureCarteraMensualSchema();
+    await client.query('BEGIN');
+    await client.query('DELETE FROM cartera_mensual WHERE anio = $1 AND mes = $2', [anio, mes]);
+    const CHUNK = 1000;
+    for (let i = 0; i < filas.length; i += CHUNK) {
+      const lote = filas.slice(i, i + CHUNK);
+      const params = [];
+      const tuples = lote.map((f, idx) => {
+        const base = idx * COLS.length;
+        params.push(anio, mes, toStr(f.dni) || '', toStr(f.vendedor) || '', toStr(f.tipoBase) || '', toStr(f.tipoCliente) || '', toStr(f.sede) || '');
+        return '(' + COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+      });
+      await client.query(`INSERT INTO cartera_mensual (${COLS.join(',')}) VALUES ${tuples.join(',')}`, params);
+    }
+    // Si se vuelve a subir la base de un mes, el snapshot congelado (si lo había)
+    // queda obsoleto: se borra para que se recalcule con la base nueva.
+    await client.query('DELETE FROM cartera_mensual_snapshot WHERE anio = $1 AND mes = $2', [anio, mes]);
+    await client.query('COMMIT');
+    res.json({ success: true, filas: filas.length });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('❌ POST /cartera-mensual/import:', e);
+    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
+  } finally { client.release(); }
+});
+
+// GET /cartera-mensual/snapshot?anio=&mes= → [{sede,asignados,vendidos,monto}] si ese mes
+// ya quedó congelado (vacío si todavía no se congeló, ej. el mes en curso).
+app.get('/cartera-mensual/snapshot', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const anio = parseInt(req.query.anio, 10);
+  const mes = parseInt(req.query.mes, 10);
+  if (!anio || !mes) return res.status(400).json({ success: false, message: 'Faltan anio/mes.' });
+  try {
+    await ensureCarteraMensualSchema();
+    const { rows } = await pgPool.query(
+      `SELECT sede, asignados, vendidos, monto::float8 AS monto
+         FROM cartera_mensual_snapshot WHERE anio = $1 AND mes = $2`, [anio, mes]);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /cartera-mensual/snapshot:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
+// POST /cartera-mensual/snapshot { anio, mes, filas:[{sede,asignados,vendidos,monto}] }
+// Congela el resultado de un mes que ya pasó. NUNCA pisa un snapshot que ya existe
+// (ON CONFLICT DO NOTHING): una vez congelado, un mes no se vuelve a tocar salvo que
+// se borre explícitamente (ej. al volver a subir la base de ese mes, ver /import).
+app.post('/cartera-mensual/snapshot', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const anio = parseInt(req.body?.anio, 10);
+  const mes = parseInt(req.body?.mes, 10);
+  const filas = Array.isArray(req.body?.filas) ? req.body.filas : [];
+  if (!anio || !mes) return res.status(400).json({ success: false, message: 'Faltan anio/mes.' });
+  try {
+    await ensureCarteraMensualSchema();
+    for (const f of filas) {
+      await pgPool.query(
+        `INSERT INTO cartera_mensual_snapshot (anio, mes, sede, asignados, vendidos, monto)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (anio, mes, sede) DO NOTHING`,
+        [anio, mes, toStr(f.sede) || 'SIN SEDE', toInt(f.asignados) || 0, toInt(f.vendidos) || 0, toNum(f.monto) || 0]);
+    }
+    res.json({ success: true });
+  } catch (e) { console.error('❌ POST /cartera-mensual/snapshot:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
   ok: true, service: 'ventas-service', db: !!pgPool, ts: new Date().toISOString(),
