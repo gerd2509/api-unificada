@@ -2952,6 +2952,9 @@ app.get('/reporte-global', async (req, res) => {
         SELECT sede,
           NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') AS entidad,
           (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto,
+          -- Para separar, en Motos por Sede, "Propio (Leoncito)" en Crédito (cuotas>0) vs
+          -- Contado (cuotas=0) — mismo valor para la venta sea bruto o nc (es la misma fila).
+          (COALESCE(cuotas,0) > 0) AS con_cuotas,
           monto_consolidado, anio_cv, mes_cv, dia_cv, anio_af, mes_af, dia_af,
           (UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%') AS es_nc
         FROM ventas
@@ -2960,30 +2963,30 @@ app.get('/reporte-global', async (req, res) => {
       bruto AS (
         -- TODAS las ventas del periodo por su mes de VENTA (congelado), incluidas las que
         -- ya son NC/incautación a valor pleno — es el universo "monto_bruto"/"ops_bruto".
-        SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops
+        SELECT sede, entidad, es_moto, con_cuotas, SUM(monto_consolidado) AS monto, COUNT(*) AS ops
         FROM ent WHERE anio_cv = $1 AND ($2 = 0 OR mes_cv = $2) AND ($3 = 0 OR dia_cv <= $3)
-        GROUP BY sede, entidad, es_moto
+        GROUP BY sede, entidad, es_moto, con_cuotas
       ),
       nc AS (
         -- NC/incautaciones que afectan el periodo por su propio mes de AFECTACIÓN: si la
         -- NC es del mismo mes de la venta, netea exactamente esa venta (bruto − nc = 0 esa
         -- fila); si es de un mes posterior, resta "arrastrada" sin tocar el mes de venta.
-        SELECT sede, entidad, es_moto, SUM(monto_consolidado) AS monto, COUNT(*) AS ops
+        SELECT sede, entidad, es_moto, con_cuotas, SUM(monto_consolidado) AS monto, COUNT(*) AS ops
         FROM ent WHERE es_nc AND anio_af = $1 AND ($2 = 0 OR mes_af = $2) AND ($3 = 0 OR dia_af <= $3)
-        GROUP BY sede, entidad, es_moto
+        GROUP BY sede, entidad, es_moto, con_cuotas
       ),
       claves AS (
-        SELECT sede, entidad, es_moto FROM bruto
-        UNION SELECT sede, entidad, es_moto FROM nc
+        SELECT sede, entidad, es_moto, con_cuotas FROM bruto
+        UNION SELECT sede, entidad, es_moto, con_cuotas FROM nc
       )
-      SELECT k.sede, k.entidad, k.es_moto,
+      SELECT k.sede, k.entidad, k.es_moto, k.con_cuotas,
         ROUND(COALESCE(b.monto,0) - COALESCE(n.monto,0))::int AS neto,
         (COALESCE(b.ops,0) - COALESCE(n.ops,0))::int AS ops,
         ROUND(COALESCE(b.monto,0))::int AS monto_bruto,
         COALESCE(b.ops,0)::int AS ops_bruto
       FROM claves k
-      LEFT JOIN bruto b ON b.sede = k.sede AND b.entidad IS NOT DISTINCT FROM k.entidad AND b.es_moto = k.es_moto
-      LEFT JOIN nc    n ON n.sede = k.sede AND n.entidad IS NOT DISTINCT FROM k.entidad AND n.es_moto = k.es_moto
+      LEFT JOIN bruto b ON b.sede = k.sede AND b.entidad IS NOT DISTINCT FROM k.entidad AND b.es_moto = k.es_moto AND b.con_cuotas = k.con_cuotas
+      LEFT JOIN nc    n ON n.sede = k.sede AND n.entidad IS NOT DISTINCT FROM k.entidad AND n.es_moto = k.es_moto AND n.con_cuotas = k.con_cuotas
       ORDER BY k.sede, k.entidad`, [anio, mes, dia])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
@@ -3019,6 +3022,11 @@ app.get('/reporte-global-detalle', async (req, res) => {
       const entidad = String(req.query.entidad || '').trim().toUpperCase();
       params.push(entidad);
       cond.push(`NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') IS NOT DISTINCT FROM NULLIF($${params.length},'')`);
+    }
+    // Motos por Sede: Propio (Leoncito) separado en Crédito (cuotas>0) / Contado (cuotas=0).
+    if (req.query.conCuotas !== undefined) {
+      params.push(req.query.conCuotas === '1' || req.query.conCuotas === 'true');
+      cond.push(`(COALESCE(cuotas,0) > 0) = $${params.length}`);
     }
     const marca = req.query.marca ? String(req.query.marca).trim().toUpperCase() : '';
     const tipo = req.query.tipo ? String(req.query.tipo).trim().toUpperCase() : '';
