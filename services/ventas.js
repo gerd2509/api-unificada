@@ -1897,8 +1897,13 @@ const LEADS = {
 // automatización del CRM, no por una persona) — si se sobreescribe sin más, un lead ya
 // respondido vuelve a aparecer como "no respondido". Por eso NO se pisa con un valor
 // vacío: solo se actualiza cuando Kommo trae un `modificado_por` con contenido real.
+// La referencia al valor actual va calificada como "t.modificado_por" (ver el alias
+// "AS t" en upsertLeadsChunk): sin calificar, Postgres la toma como ambigua entre la
+// fila objetivo y EXCLUDED dentro de un INSERT ... ON CONFLICT con VALUES multi-fila
+// (probado: el mismo UPDATE sin alias falla con "column reference is ambiguous" y
+// rompía CADA upsert de la sincronización, sin escribir nada ni avisar bien el error).
 const leadsSet = LEADS_COLS.slice(1).map(c => c === 'modificado_por'
-  ? `modificado_por = COALESCE(NULLIF(EXCLUDED.modificado_por, ''), modificado_por)`
+  ? `modificado_por = COALESCE(NULLIF(EXCLUDED.modificado_por, ''), t.modificado_por)`
   : `${c} = EXCLUDED.${c}`
 ).join(', ') + ', updated_at = now()';
 const leadsSchemaLista = {};
@@ -1919,7 +1924,7 @@ async function upsertLeadsChunk(client, tabla, chunk) {
     const base = i * LEADS_COLS.length; params.push(...row);
     return '(' + LEADS_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
   });
-  const sql = `INSERT INTO ${tabla} (${LEADS_COLS.join(',')}) VALUES ${tuples.join(',')}
+  const sql = `INSERT INTO ${tabla} AS t (${LEADS_COLS.join(',')}) VALUES ${tuples.join(',')}
     ON CONFLICT (id) DO UPDATE SET ${leadsSet} RETURNING (xmax = 0) AS inserted`;
   const { rows } = await client.query(sql, params);
   let inserted = 0; for (const r of rows) if (r.inserted) inserted++;
