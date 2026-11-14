@@ -1891,7 +1891,16 @@ const LEADS = {
   call:    { tabla: 'leads_kommo_call',    cargas: 'leads_kommo_call_cargas' },
   realzza: { tabla: 'leads_kommo_realzza', cargas: 'leads_kommo_realzza_cargas' },
 };
-const leadsSet = LEADS_COLS.slice(1).map(c => `${c} = EXCLUDED.${c}`).join(', ') + ', updated_at = now()';
+// `modificado_por` es la base para decidir si un lead está "respondido" (Listado Kommo
+// Realzza, Auditoría Kommo). Algunas sincronizaciones de Kommo devuelven ese campo en
+// blanco para un lead que YA tenía un responsable real (p.ej. un cambio disparado por
+// automatización del CRM, no por una persona) — si se sobreescribe sin más, un lead ya
+// respondido vuelve a aparecer como "no respondido". Por eso NO se pisa con un valor
+// vacío: solo se actualiza cuando Kommo trae un `modificado_por` con contenido real.
+const leadsSet = LEADS_COLS.slice(1).map(c => c === 'modificado_por'
+  ? `modificado_por = COALESCE(NULLIF(EXCLUDED.modificado_por, ''), modificado_por)`
+  : `${c} = EXCLUDED.${c}`
+).join(', ') + ', updated_at = now()';
 const leadsSchemaLista = {};
 async function ensureLeadsSchema(canal) {
   const c = LEADS[canal];
