@@ -2245,8 +2245,13 @@ function registrarLeads(canal, ruta) {
   });
   // GET /{ruta}/sync-kommo/estado — para que el front haga polling del avance de la
   // sincronización en segundo plano en vez de esperar colgado la respuesta del POST.
-  app.get(`/${ruta}/sync-kommo/estado`, (req, res) => {
-    res.json({ success: true, ...kommoSyncEstado });
+  // Incluye SIEMPRE ultimaSincronizacionUnix (de la última corrida YA TERMINADA, esté
+  // o no una nueva en curso) — así el front puede mostrar "hace X" sin depender de
+  // confiar en el contador de una sincronización que podría estar yendo lenta.
+  app.get(`/${ruta}/sync-kommo/estado`, async (req, res) => {
+    let ultimaSincronizacionUnix = null;
+    try { ultimaSincronizacionUnix = await kommoUltimoSyncUnix(c); } catch (e) { console.error('❌ kommoUltimoSyncUnix:', e); }
+    res.json({ success: true, ...kommoSyncEstado, ultimaSincronizacionUnix });
   });
   // GET /{ruta}/listado?anio=&mes=&tienda= — listado de leads (ID, nombre del
   // cliente, embudo, estado, fechas, quién modificó) para ver de un vistazo si cada
