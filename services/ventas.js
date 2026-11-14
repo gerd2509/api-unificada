@@ -3037,6 +3037,8 @@ app.get('/reporte-global-detalle', async (req, res) => {
         params.push(marca);
         cond.push(`(CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%WANXIN%' THEN 'WANXIN'
                          WHEN UPPER(COALESCE(productos,'')) LIKE '%SSENDA%' THEN 'SSENDA'
+                         WHEN UPPER(COALESCE(productos,'')) LIKE '%MAQUIMOTORA%' THEN 'MAQUIMOTORA'
+                         WHEN UPPER(COALESCE(productos,'')) LIKE '%SONLINK%' THEN 'SONLINK'
                          ELSE 'OTRAS' END) = $${params.length}`);
       }
       if (tipo) {
@@ -3084,6 +3086,8 @@ app.get('/reporte-global-motos', async (req, res) => {
           CASE WHEN UPPER(COALESCE(entidad,'')) = 'GLOBAL GO' THEN 'GLOBAL' ELSE 'PROPIO' END AS credito,
           CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%WANXIN%' THEN 'WANXIN'
                WHEN UPPER(COALESCE(productos,'')) LIKE '%SSENDA%' THEN 'SSENDA'
+               WHEN UPPER(COALESCE(productos,'')) LIKE '%MAQUIMOTORA%' THEN 'MAQUIMOTORA'
+               WHEN UPPER(COALESCE(productos,'')) LIKE '%SONLINK%' THEN 'SONLINK'
                ELSE 'OTRAS' END AS marca,
           CASE WHEN UPPER(COALESCE(productos,'')) LIKE '%TRIMOTO DE CARGA%' THEN 'MOTO CARGUERA'
                WHEN UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%LINEAL%' THEN 'MOTO LINEAL'
