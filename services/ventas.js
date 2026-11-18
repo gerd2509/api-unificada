@@ -333,12 +333,19 @@ app.get('/ventas/estado', async (req, res) => {
   }
 });
 
+// Sedes que NO son venta real: "INCAUTADOS - ..." (recuperos) y "OFICINA PRINCIPAL - ..."
+// (registros administrativos). No cuentan en Ventas (Call / Realzza / Sedes), Atribución
+// ni sueldo. `col` = columna sede (con su alias).
+function sedeEsVenta(col = 'sede') {
+  return `NOT (UPPER(COALESCE(${col}, '')) LIKE 'INCAUTADOS%' OR UPPER(COALESCE(${col}, '')) LIKE 'OFICINA PRINCIPAL%')`;
+}
+
 app.get('/ventas', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
-    const cond = [];
+    const cond = [sedeEsVenta('sede')];
     const params = [];
     const anio = req.query.anio ? parseInt(req.query.anio, 10) : null;
     const mes  = req.query.mes  ? parseInt(req.query.mes, 10)  : null;
@@ -388,17 +395,17 @@ app.get('/ventas/evolutivo', async (req, res) => {
     const rows = await cached('ventas/evolutivo', req.query.fresh, async () => (await pgPool.query(`
       WITH ven AS (
         SELECT sede, anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
-        WHERE monto_consolidado > 0 AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL
+        WHERE monto_consolidado > 0 AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL AND ${sedeEsVenta('sede')}
         GROUP BY sede, anio_cv, mes_cv
       ),
       ncnr AS (
         SELECT n.sede, n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
-        WHERE UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
+        WHERE UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL AND ${sedeEsVenta('n.sede')}
         GROUP BY n.sede, n.anio_af, n.mes_af
       ),
       inc AS (
         SELECT sede, anio_af AS anio, mes_af AS mes, SUM(monto_consolidado) AS monto FROM ventas
-        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af IS NOT NULL AND mes_af IS NOT NULL
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af IS NOT NULL AND mes_af IS NOT NULL AND ${sedeEsVenta('sede')}
         GROUP BY sede, anio_af, mes_af
       ),
       claves AS (
@@ -666,7 +673,7 @@ function registrarCanal(canal, ruta) {
       const afA = j ? 'v.anio_af' : 'anio_af';
       const afM = j ? 'v.mes_af'  : 'mes_af';
       const vendCol = j ? 'v.vendedor' : `${px}vendedor`;
-      const cond = [], params = [];
+      const cond = [sedeEsVenta(`${px}sede`)], params = [];
       if (j) cond.push(`v.sede ILIKE '%REALZZA%'`);      // solo tienda Realzza
       const anio = req.query.anio ? parseInt(req.query.anio, 10) : null;
       const mes  = req.query.mes  ? parseInt(req.query.mes, 10)  : null;
@@ -833,7 +840,7 @@ app.post('/ventas-call/cruzar', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribVentas();
-    const cond = ['NOT v.asesor_manual']; const params = [DERIV_MOTIVOS];
+    const cond = ['NOT v.asesor_manual', sedeEsVenta('v.sede')]; const params = [DERIV_MOTIVOS];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const where = cond.join(' AND ');
@@ -871,7 +878,7 @@ app.get('/ventas-call/buscar', async (req, res) => {
     await ensureAtribVentas();
     const dni = String(req.query.dni || '').replace(/\D/g, '');
     if (!dni) return res.json([]);
-    const cond = [`regexp_replace(v.doc_identidad, '\\D', '', 'g') = $2`];
+    const cond = [`regexp_replace(v.doc_identidad, '\\D', '', 'g') = $2`, sedeEsVenta('v.sede')];
     const params = [DERIV_MOTIVOS, dni];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
@@ -891,7 +898,7 @@ app.get('/ventas-call/atribucion', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribVentas();
-    const cond = ['(m.cc IS NOT NULL OR v.asesor_manual)']; const params = [DERIV_MOTIVOS];
+    const cond = ['(m.cc IS NOT NULL OR v.asesor_manual)', sedeEsVenta('v.sede')]; const params = [DERIV_MOTIVOS];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const { rows } = await pgPool.query(`
@@ -941,7 +948,7 @@ app.post('/ventas-call/consolidar', async (req, res) => {
   try {
     await ensureAtribVentas();
     await ensureCanalSchema('call');   // asegura la tabla ventas_call
-    const cond = ['(m.cc IS NOT NULL OR v.asesor_manual)']; const params = [DERIV_MOTIVOS];
+    const cond = ['(m.cc IS NOT NULL OR v.asesor_manual)', sedeEsVenta('v.sede')]; const params = [DERIV_MOTIVOS];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     // Columnas destino en ventas_call (codigo_cv es la clave; no se pisa en el UPDATE).
@@ -1385,13 +1392,13 @@ app.get('/ventas-sedes/sueldo', async (req, res) => {
        FROM margen_ventas mv
        WHERE mv.codigo_cv IN (
          SELECT codigo_cv FROM ventas
-         WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_cv = $2 AND anio_cv = $3)`,
+         WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_cv = $2 AND anio_cv = $3 AND ${sedeEsVenta('sede')})`,
       [vendedor, mes, anio]);
     // NC e Incautaciones por MES DE AFECTACIÓN (con IGV, como en el Excel).
     const af = await pgPool.query(
       `SELECT COALESCE(SUM(monto_consolidado) FILTER (WHERE UPPER(estado_venta) LIKE '%NOTA DE CR%'),0) AS nc,
               COALESCE(SUM(monto_consolidado) FILTER (WHERE UPPER(estado_venta) LIKE '%INCAUTAC%'),0) AS inc
-       FROM ventas WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_af = $2 AND anio_af = $3`,
+       FROM ventas WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_af = $2 AND anio_af = $3 AND ${sedeEsVenta('sede')}`,
       [vendedor, mes, anio]);
     // Canal del CAP (para el Bono Campañero). CAMPAÑA* → campañero; RECP* → receptivo.
     const cap = await pgPool.query(
@@ -1447,7 +1454,7 @@ app.get('/ventas-sedes/sueldo', async (req, res) => {
     // Adicional por motos GLOBAL GO (per-unit, misma lógica que Call/Realzza): ≥5 → 125 c/u, si no 100.
     const mgo = await pgPool.query(
       `SELECT COUNT(*)::int c FROM ventas
-       WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_cv = $2 AND anio_cv = $3
+       WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_cv = $2 AND anio_cv = $3 AND ${sedeEsVenta('sede')}
          AND UPPER(estado_tipo_producto) LIKE '%MOTO%' AND UPPER(entidad) LIKE '%GLOBAL GO%'
          AND UPPER(estado_venta) NOT LIKE '%NOTA DE CR%' AND UPPER(estado_venta) NOT LIKE '%INCAUTAC%'`,
       [vendedor, mes, anio]);
