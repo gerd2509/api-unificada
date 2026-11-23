@@ -3110,6 +3110,16 @@ app.get('/reporte-global-detalle', async (req, res) => {
       ),${REFACT_CTE}
       SELECT b.codigo_cv, b.vendedor, b.cliente_venta AS cliente, b.doc_identidad AS dni, b.productos AS producto,
         COALESCE(NULLIF(TRIM(b.entidad),''), 'LEONCITO') AS entidad, b.estado_venta,
+        CASE WHEN UPPER(COALESCE(b.productos,'')) LIKE '%WANXIN%' THEN 'WANXIN'
+             WHEN UPPER(COALESCE(b.productos,'')) LIKE '%SSENDA%' THEN 'SSENDA'
+             WHEN UPPER(COALESCE(b.productos,'')) LIKE '%MAQUIMOTORA%' THEN 'MAQUIMOTORA'
+             WHEN UPPER(COALESCE(b.productos,'')) LIKE '%SONLINK%' THEN 'SONLINK'
+             ELSE 'OTRAS' END AS marca,
+        CASE WHEN UPPER(COALESCE(b.productos,'')) LIKE '%TRIMOTO DE CARGA%' THEN 'MOTO CARGUERA'
+             WHEN UPPER(COALESCE(b.estado_tipo_producto,'')) LIKE '%LINEAL%' THEN 'MOTO LINEAL'
+             WHEN UPPER(COALESCE(b.estado_tipo_producto,'')) LIKE '%TAXI%'
+               OR UPPER(COALESCE(b.productos,'')) LIKE '%TRIMOTO%' THEN 'MOTOTAXI'
+             ELSE 'OTRO' END AS tipo, b.sede,
         ROUND(b.monto_consolidado)::int AS monto, b.dia_cv, b.mes_cv, b.anio_cv,
         (UPPER(COALESCE(b.estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(b.estado_venta,'')) LIKE '%INCAUTAC%') AS tiene_nc,
         b.dia_af, b.mes_af, b.anio_af,
