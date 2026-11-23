@@ -3096,13 +3096,27 @@ app.get('/reporte-global-detalle', async (req, res) => {
       }
     }
 
+    // Además del detalle base: código CV, DNI, estado, la NC/incautación (con su fecha de
+    // afectación y si cayó en un mes POSTERIOR al de la venta) y si la venta es una
+    // REFACTURACIÓN (no cuenta como operación nueva en los conteos — ver REFACT_CTE).
     const { rows } = await pgPool.query(`
-      SELECT vendedor, cliente_venta AS cliente, productos AS producto,
-        COALESCE(NULLIF(TRIM(entidad),''), 'LEONCITO') AS entidad,
-        ROUND(monto_consolidado)::int AS monto, dia_cv, mes_cv, anio_cv
-      FROM ventas
-      WHERE ${cond.join(' AND ')}
-      ORDER BY anio_cv DESC, mes_cv DESC, dia_cv DESC, monto_consolidado DESC`,
+      WITH base AS (
+        SELECT * FROM ventas WHERE ${cond.join(' AND ')}
+      ),
+      per AS (
+        SELECT codigo_cv, fecha_cv, regexp_replace(COALESCE(doc_identidad,''), '\\D', '', 'g') AS dni,
+               (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto
+        FROM base
+      ),${REFACT_CTE}
+      SELECT b.codigo_cv, b.vendedor, b.cliente_venta AS cliente, b.doc_identidad AS dni, b.productos AS producto,
+        COALESCE(NULLIF(TRIM(b.entidad),''), 'LEONCITO') AS entidad, b.estado_venta,
+        ROUND(b.monto_consolidado)::int AS monto, b.dia_cv, b.mes_cv, b.anio_cv,
+        (UPPER(COALESCE(b.estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(b.estado_venta,'')) LIKE '%INCAUTAC%') AS tiene_nc,
+        b.dia_af, b.mes_af, b.anio_af,
+        (b.anio_af IS NOT NULL AND (b.anio_af * 12 + b.mes_af) > (b.anio_cv * 12 + b.mes_cv)) AS nc_mes_posterior,
+        (r.codigo_cv IS NOT NULL) AS es_refacturacion
+      FROM base b LEFT JOIN refact r ON r.codigo_cv = b.codigo_cv
+      ORDER BY b.anio_cv DESC, b.mes_cv DESC, b.dia_cv DESC, b.monto_consolidado DESC`,
       params);
     res.json(rows);
   } catch (e) { console.error('❌ GET /reporte-global-detalle:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
