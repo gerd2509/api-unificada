@@ -2299,6 +2299,24 @@ function registrarLeads(canal, ruta) {
     const cuentas = KOMMO_CUENTAS.map(k => ({ cuenta: k.cuenta, nombre: k.nombre, configurada: kommoCuentaConfigurada(k) }));
     res.json({ success: true, ...kommoSyncEstado, ultimaSincronizacionUnix, cuentas });
   });
+  // GET /{ruta}/inicio-cuenta?tienda= — fecha del PRIMER lead de esa tienda en la cuenta
+  // Kommo Piura/Lima (null si aún no tiene leads). Desde esa fecha recién cuentan sus
+  // gestiones/ventas en el embudo KOMMO del Listado (antes no existía la cuenta).
+  app.get(`/${ruta}/inicio-cuenta`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureLeadsSchema(canal);
+      const tienda = tiendaRzParam(req.query.tienda);
+      if (tienda !== 'REALZZA PIURA' && tienda !== 'REALZZA LIMA') return res.json({ success: true, aplica: false, fecha: null });
+      const { rows } = await pgPool.query(
+        `SELECT MIN(make_date(anio_cr, mes_cr, dia_cr))::text AS fecha FROM ${c.tabla}
+         WHERE cuenta = 'PL' AND anio_cr IS NOT NULL AND mes_cr IS NOT NULL AND dia_cr IS NOT NULL ${leadsTiendaSQL(tienda)}`);
+      res.json({ success: true, aplica: true, fecha: rows[0]?.fecha || null });
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}/inicio-cuenta:`, error);
+      res.status(500).json({ success: false, message: 'No se pudo obtener el inicio de la cuenta.' });
+    }
+  });
   // GET /{ruta}/listado?anio=&mes=&tienda= — listado de leads (ID, nombre del
   // cliente, embudo, estado, fechas, quién modificó) para ver de un vistazo si cada
   // lead está respondido (modificado_por vacío = sin responder).
