@@ -1468,6 +1468,44 @@ app.delete('/bonos-manuales/:id', async (req, res) => {
   } catch (e) { console.error('❌ DELETE /bonos-manuales/:id:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
+// ── Recordatorios de Pulso comercial ─────────────────────────────────────────
+// Pulso (la app del administrador) deja recordatorios en pulso_recordatorios; el panel
+// del asesor los consulta aquí y los muestra en grande. Cada asesor solo ve los SUYOS:
+// el nombre sale de su sesión (JWT), nunca del request.
+const vendedorDeSesion = (req) => String(req.usuario?.vendedor || '').toUpperCase().trim();
+
+// GET /recordatorios/mios → recordatorios sin ver de las últimas 14 h (máx. 3)
+app.get('/recordatorios/mios', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const vendedor = vendedorDeSesion(req);
+  if (!vendedor) return res.json({ success: true, data: [] });
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT id, titulo, mensaje, detalle, origen, creado_en
+         FROM pulso_recordatorios
+        WHERE asesor = $1 AND visto_en IS NULL AND creado_en > now() - interval '14 hours'
+        ORDER BY id DESC LIMIT 3`, [vendedor]);
+    res.json({ success: true, data: rows });
+  } catch (e) {
+    // Si la tabla aún no existe (Pulso no instalado) no se rompe el panel
+    if (e.code === '42P01') return res.json({ success: true, data: [] });
+    console.error('❌ GET /recordatorios/mios:', e.message); res.status(500).json({ success: false, message: 'Error interno del servidor.' });
+  }
+});
+
+// POST /recordatorios/:id/visto → el asesor confirma que lo leyó
+app.post('/recordatorios/:id/visto', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  const vendedor = vendedorDeSesion(req);
+  const id = parseInt(req.params.id, 10);
+  if (!vendedor || !id) return res.status(400).json({ success: false, message: 'Solicitud inválida.' });
+  try {
+    const { rowCount } = await pgPool.query(
+      'UPDATE pulso_recordatorios SET visto_en = now() WHERE id = $1 AND asesor = $2 AND visto_en IS NULL', [id, vendedor]);
+    res.json({ success: true, actualizado: rowCount > 0 });
+  } catch (e) { console.error('❌ POST /recordatorios/:id/visto:', e.message); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
+});
+
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
   ok: true, service: 'gestion-service', db: !!pgPool, ts: new Date().toISOString(),
