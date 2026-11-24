@@ -35,6 +35,9 @@ const corsOptions = {
     if (!origin || origenesPermitidos.includes(origin)) return cb(null, true);
     cb(null, false);   // origen no permitido → sin cabecera CORS (el navegador bloquea la lectura)
   },
+  // El navegador guarda 24 h el resultado del "preflight" (OPTIONS → 204). Sin esto repetía
+  // la verificación antes de casi cada petición: ~89 mil OPTIONS extra al mes.
+  maxAge: 86400,
 };
 
 /** Límite general por IP: 600 peticiones / 15 min (dashboard con varias pantallas
