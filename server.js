@@ -33,6 +33,10 @@ app.get('/', (_req, res) => res.json({
   ts: new Date().toISOString(),
 }));
 
+// /health/deep: memoria real del proceso, uptime y ping a la BD para el Monitor PWA.
+// Protegido con el header x-monitor-token (variable MONITOR_TOKEN). Sin ella responde 404.
+app.use('/health', require('./health-deep'));
+
 app.use('/sheets',  require('./services/sheets'));
 app.use('/ventas',  require('./services/ventas'));
 app.use('/gestion', require('./services/gestion'));
