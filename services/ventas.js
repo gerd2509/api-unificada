@@ -17,6 +17,7 @@ const compression = require('compression');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const { Pool } = require('pg');
+const { AsyncLocalStorage } = require('async_hooks');
 const { aplicarSeguridad, crearRequireAuth } = require('./_security');
 
 const app = express();
@@ -1879,7 +1880,16 @@ const leadsDdl = (t) => `
   ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS status_id BIGINT;
   ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS responsible_user_id BIGINT;
   CREATE INDEX IF NOT EXISTS ix_${t}_anio_mes ON ${t} (anio_cr, mes_cr);
-  CREATE INDEX IF NOT EXISTS ix_${t}_pipeline ON ${t} (pipeline_id);`;
+  CREATE INDEX IF NOT EXISTS ix_${t}_pipeline ON ${t} (pipeline_id);
+  ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS cuenta TEXT NOT NULL DEFAULT 'CIX';`;
+// Filtro de tienda sobre los leads Realzza (embudo con sufijo PIURA/LIMA). Chiclayo además
+// excluye la cuenta Piura/Lima: un lead suyo en un embudo sin sufijo (p.ej. el "Embudo de
+// ventas" general antes de asignarse) no es de Chiclayo — solo sale en "todas".
+function leadsTiendaSQL(tienda) {
+  if (!tienda) return '';
+  const base = sedeTiendaSQL('embudo', tienda);
+  return tienda === 'REALZZA' ? `${base} AND COALESCE(cuenta,'CIX') <> 'PL'` : base;
+}
 const LEADS = {
   call:    { tabla: 'leads_kommo_call',    cargas: 'leads_kommo_call_cargas' },
   realzza: { tabla: 'leads_kommo_realzza', cargas: 'leads_kommo_realzza_cargas' },
@@ -1930,10 +1940,22 @@ async function upsertLeadsChunk(client, tabla, chunk) {
 // lead (quién, cuándo, en qué embudo/estado) — el CONTENIDO del chat sigue sin
 // disponible hasta que Kommo vincule el canal de mensajería a esta integración.
 // ─────────────────────────────────────────────────────────────────────────────
+// Cuentas de Kommo de Realzza. Todas se guardan en leads_kommo_realzza (columna `cuenta`);
+// la tienda sale del nombre del embudo (sufijo PIURA / LIMA; sin sufijo = Chiclayo).
+//   · CIX = cuenta original (Chiclayo)       → KOMMO_LONG_LIVED_TOKEN / KOMMO_SUBDOMAIN
+//   · PL  = cuenta aparte de Piura y Lima    → KOMMO_RZ_PL_TOKEN / KOMMO_RZ_PL_SUBDOMAIN
+// marca = cargado_por de sus cargas: de ahí parte el próximo sync incremental de esa cuenta.
+const KOMMO_CUENTAS = [
+  { cuenta: 'CIX', nombre: 'Chiclayo',   tokenEnv: 'KOMMO_LONG_LIVED_TOKEN', subEnv: 'KOMMO_SUBDOMAIN',       marca: 'Sincronización Kommo API' },
+  { cuenta: 'PL',  nombre: 'Piura/Lima', tokenEnv: 'KOMMO_RZ_PL_TOKEN',      subEnv: 'KOMMO_RZ_PL_SUBDOMAIN', marca: 'Sincronización Kommo API PL' },
+];
+const kommoCuentaCtx = new AsyncLocalStorage();   // cuenta activa durante un sync
+const kommoCuentaConfigurada = (k) => !!(process.env[k.tokenEnv] && process.env[k.subEnv]);
 async function kommoFetch(path, intento = 1) {
-  const token = process.env.KOMMO_LONG_LIVED_TOKEN;
-  const sub = process.env.KOMMO_SUBDOMAIN;
-  if (!token || !sub) throw new Error('Kommo no configurado (faltan KOMMO_LONG_LIVED_TOKEN / KOMMO_SUBDOMAIN en el .env).');
+  const k = kommoCuentaCtx.getStore() || KOMMO_CUENTAS[0];
+  const token = process.env[k.tokenEnv];
+  const sub = process.env[k.subEnv];
+  if (!token || !sub) throw new Error(`Kommo ${k.nombre} no configurado (faltan ${k.tokenEnv} / ${k.subEnv} en el .env).`);
   let resp;
   try {
     resp = await fetch(`https://${sub}.kommo.com${path}`, {
@@ -2077,10 +2099,10 @@ async function kommoListarLeads(desdeUnix, hastaUnix, onLote) {
 // Timestamp (unix) de la última sincronización CONTRA LA API de Kommo (no cuenta
 // las subidas manuales de Excel) — se usa como punto de partida para traer solo lo
 // que cambió desde entonces, en vez de la cuenta completa cada vez.
-async function kommoUltimoSyncUnix(c) {
+async function kommoUltimoSyncUnix(c, marca = 'Sincronización Kommo API') {
   const { rows } = await pgPool.query(
     `SELECT EXTRACT(EPOCH FROM creado_en)::bigint AS t FROM ${c.cargas}
-     WHERE cargado_por = 'Sincronización Kommo API' ORDER BY creado_en DESC LIMIT 1`);
+     WHERE cargado_por = $1 ORDER BY creado_en DESC LIMIT 1`, [marca]);
   return rows[0]?.t ? Number(rows[0].t) : 0;
 }
 
@@ -2137,10 +2159,31 @@ function registrarLeads(canal, ruta) {
   // una sola transacción abierta por varios minutos esperando a Kommo entre medio
   // (el mismo problema de locks/statement_timeout que ya tuvimos con las
   // importaciones largas de ventas).
+  // Sincroniza TODAS las cuentas configuradas (Chiclayo y, si tiene credenciales,
+  // Piura/Lima) una tras otra, con los totales sumados. Si una cuenta falla, las demás
+  // siguen y el error queda en resultado.errores.
   async function ejecutarSyncKommo(anio, mes, completo, cargadoPor) {
+    let filas = 0, insertados = 0, actualizados = 0, incremental = true;
+    const errores = [];
+    for (const k of KOMMO_CUENTAS) {
+      if (!kommoCuentaConfigurada(k)) continue;
+      try {
+        const r = await kommoCuentaCtx.run(k, () => ejecutarSyncKommoCuenta(k, anio, mes, completo,
+          k.cuenta === 'CIX' ? cargadoPor : k.marca, { filas, insertados, actualizados }));
+        filas += r.filas; insertados += r.insertados; actualizados += r.actualizados;
+        incremental = incremental && r.incremental;
+      } catch (e) {
+        console.error(`❌ Sync Kommo ${k.nombre}:`, e);
+        errores.push(`${k.nombre}: ${e.message || 'error'}`);
+        if (k.cuenta === 'CIX') throw e;   // la cuenta principal falla → el sync falla (como antes)
+      }
+    }
+    return { filas, insertados, actualizados, incremental, ...(errores.length ? { errores } : {}) };
+  }
+  async function ejecutarSyncKommoCuenta(k, anio, mes, completo, cargadoPor, previo) {
     const ahoraUnix = Math.floor(Date.now() / 1000);
     const MARGEN_SEG = 5 * 60; // margen por si el reloj o el proceso anterior se demoró
-    const ultimoSyncUnix = completo ? 0 : await kommoUltimoSyncUnix(c);
+    const ultimoSyncUnix = completo ? 0 : await kommoUltimoSyncUnix(c, k.marca);
     const desdeUnix = ultimoSyncUnix ? Math.max(0, ultimoSyncUnix - MARGEN_SEG) : null;
 
     const mapas = await kommoMapas();
@@ -2172,11 +2215,15 @@ function registrarLeads(canal, ruta) {
       try {
         const r = await upsertLeadsChunk(client, c.tabla, rows);
         insertados += r.inserted; actualizados += r.updated;
+        await client.query(`UPDATE ${c.tabla} SET cuenta = $1 WHERE id = ANY($2::bigint[]) AND cuenta IS DISTINCT FROM $1`,
+          [k.cuenta, rows.map(x => x[0])]);
       } finally { client.release(); }
       totalFilas += rows.length;
       // El front hace polling de esto: así ve el avance en vivo (filas/insertados/
       // actualizados subiendo) en vez de solo "en progreso" a ciegas por minutos.
-      kommoSyncEstado = { ...kommoSyncEstado, resultado: { filas: totalFilas, insertados, actualizados, incremental: !!desdeUnix } };
+      kommoSyncEstado = { ...kommoSyncEstado, cuenta: k.nombre, resultado: {
+        filas: previo.filas + totalFilas, insertados: previo.insertados + insertados,
+        actualizados: previo.actualizados + actualizados, incremental: !!desdeUnix } };
     });
 
     // Renombrar un embudo/estado/asesor en Kommo NO toca el updated_at de cada
@@ -2191,8 +2238,8 @@ function registrarLeads(canal, ruta) {
         await client.query(
           `UPDATE ${c.tabla} AS t SET ${columna} = m.nombre
            FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::text[]) AS nombre) AS m
-           WHERE t.${idCol} = m.id AND t.${columna} IS DISTINCT FROM m.nombre`,
-          [[...mapa.keys()], [...mapa.values()]]);
+           WHERE t.${idCol} = m.id AND t.${columna} IS DISTINCT FROM m.nombre AND t.cuenta = $3`,
+          [[...mapa.keys()], [...mapa.values()], k.cuenta]);
       };
       await remapear('embudo', 'pipeline_id', mapas.embudos);
       await remapear('estado', 'status_id', mapas.estados);
@@ -2202,7 +2249,7 @@ function registrarLeads(canal, ruta) {
       // desde dónde partir, sin importar si hubo cambios esta vez o no.
       await client.query(
         `INSERT INTO ${c.cargas} (cargado_por, archivo, filas, insertados, actualizados, creado_en) VALUES ($1,$2,$3,$4,$5, to_timestamp($6))`,
-        [cargadoPor, `Kommo API ${anio}-${String(mes).padStart(2, '0')}${desdeUnix ? ' (incremental)' : ' (completo)'}`, totalFilas, insertados, actualizados, ahoraUnix]);
+        [cargadoPor, `Kommo API ${k.cuenta === 'CIX' ? '' : k.nombre + ' '}${anio}-${String(mes).padStart(2, '0')}${desdeUnix ? ' (incremental)' : ' (completo)'}`, totalFilas, insertados, actualizados, ahoraUnix]);
     } finally { client.release(); }
     return { filas: totalFilas, insertados, actualizados, incremental: !!desdeUnix };
   }
@@ -2249,7 +2296,8 @@ function registrarLeads(canal, ruta) {
   app.get(`/${ruta}/sync-kommo/estado`, async (req, res) => {
     let ultimaSincronizacionUnix = null;
     try { ultimaSincronizacionUnix = await kommoUltimoSyncUnix(c); } catch (e) { console.error('❌ kommoUltimoSyncUnix:', e); }
-    res.json({ success: true, ...kommoSyncEstado, ultimaSincronizacionUnix });
+    const cuentas = KOMMO_CUENTAS.map(k => ({ cuenta: k.cuenta, nombre: k.nombre, configurada: kommoCuentaConfigurada(k) }));
+    res.json({ success: true, ...kommoSyncEstado, ultimaSincronizacionUnix, cuentas });
   });
   // GET /{ruta}/listado?anio=&mes=&tienda= — listado de leads (ID, nombre del
   // cliente, embudo, estado, fechas, quién modificó) para ver de un vistazo si cada
@@ -2263,7 +2311,7 @@ function registrarLeads(canal, ruta) {
       if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`anio_cr = $${params.length}`); }
       if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`mes_cr = $${params.length}`); }
       const tienda = tiendaRzParam(req.query.tienda);
-      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+      const filtroTienda = leadsTiendaSQL(tienda);
       const { rows } = await pgPool.query(
         `SELECT id, nombre_cliente, embudo, estado, responsable, etiquetas,
                 (dia_cr || '/' || mes_cr || '/' || anio_cr) AS fecha_creacion,
@@ -2300,7 +2348,7 @@ function registrarLeads(canal, ruta) {
       // asesor seguido de 'PIURA'/'LIMA' cuando el lead es de esa tienda; sin sufijo =
       // Chiclayo. tiendaRzParam/sedeTiendaSQL son los mismos helpers de Ventas Realzza.
       const tienda = canal === 'realzza' ? tiendaRzParam(req.query.tienda) : '';
-      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+      const filtroTienda = leadsTiendaSQL(tienda);
       if (req.query.por === 'dia') {
         const params = []; let where = 'WHERE dia_cr IS NOT NULL AND mes_cr IS NOT NULL AND anio_cr IS NOT NULL';
         if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); where += ` AND anio_cr = $${params.length}`; }
@@ -2331,7 +2379,7 @@ function registrarLeads(canal, ruta) {
       const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
       const mes = parseInt(req.query.mes, 10) || (new Date().getMonth() + 1);
       const tienda = canal === 'realzza' ? tiendaRzParam(req.query.tienda) : '';
-      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+      const filtroTienda = leadsTiendaSQL(tienda);
       const { rows } = await pgPool.query(
         `SELECT id, nombre_lead, responsable, modificado_por FROM ${c.tabla} WHERE anio_cr = $1 AND mes_cr = $2 ${filtroTienda}`,
         [anio, mes]);
@@ -2355,7 +2403,7 @@ function registrarLeads(canal, ruta) {
       if (anioDesde && mesDesde) { params.push(anioDesde * 12 + (mesDesde - 1)); cond.push(`(anio_cr*12+(mes_cr-1)) >= $${params.length}`); }
       if (anioHasta && mesHasta) { params.push(anioHasta * 12 + (mesHasta - 1)); cond.push(`(anio_cr*12+(mes_cr-1)) <= $${params.length}`); }
       const tienda = canal === 'realzza' ? tiendaRzParam(req.query.tienda) : '';
-      const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+      const filtroTienda = leadsTiendaSQL(tienda);
       const { rows } = await pgPool.query(
         `SELECT COALESCE(NULLIF(TRIM(embudo),''),'SIN ASESOR') AS asesor,
                 COUNT(*)::int AS total,
@@ -2463,13 +2511,14 @@ app.post('/leads-kommo-realzza/auditoria/sortear', async (req, res) => {
   const client = await pgPool.connect();
   try {
     await ensureAuditoriaKommoSchema();
+    await ensureLeadsSchema('realzza');   // columna `cuenta` (filtro de tienda)
     const b = req.body || {};
     const anio = parseInt(b.anio, 10);
     const mes = parseInt(b.mes, 10);
     const cantidad = Math.max(1, parseInt(b.cantidadPorEmbudo, 10) || 5);
     const tienda = tiendaRzParam(b.tienda);
     if (!anio || !mes) return res.status(400).json({ success: false, message: 'Faltan anio/mes.' });
-    const filtroTienda = tienda ? sedeTiendaSQL('embudo', tienda) : '';
+    const filtroTienda = leadsTiendaSQL(tienda);
 
     const { rows } = await pgPool.query(
       `SELECT id, nombre_cliente, embudo, responsable, (dia_cr || '/' || mes_cr || '/' || anio_cr) AS fecha_creacion_lead
