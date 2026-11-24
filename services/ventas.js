@@ -1639,32 +1639,11 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
     res.set('Cache-Control', 'no-store');
     await ensureAtribRealzza();
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
-    // es_refacturacion: re-venta al mismo cliente tras una NC (misma regla que el Reporte
-    // Global, REFACT_CTE) → no cuenta como operación nueva en los conteos del módulo.
-    const rows = await cached(`realzza/modulo|v3|${anio}`, req.query.fresh, async () => (await pgPool.query(`
-      WITH ${MAPA_SQL_CALL_ACTIVO},
-      nc_orig AS (
-        SELECT codigo_cv, fecha_cv, COALESCE(fecha_af, fecha_cv) AS fecha_nc,
-               regexp_replace(COALESCE(doc_identidad,''), '\\D', '', 'g') AS dni,
-               (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto
-        FROM ventas
-        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND fecha_cv >= make_date($2, 1, 1) - 183
-      ),
-      per AS (
-        SELECT codigo_cv, fecha_cv, regexp_replace(COALESCE(doc_identidad,''), '\\D', '', 'g') AS dni,
-               (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto
-        FROM ventas WHERE sede ILIKE '%REALZZA%' AND (anio_cv = $2 OR anio_af = $2)
-      ),
-      refact AS (
-        SELECT DISTINCT p.codigo_cv FROM per p
-        JOIN nc_orig o ON o.dni = p.dni AND p.dni <> '' AND o.es_moto = p.es_moto AND o.codigo_cv <> p.codigo_cv
-         AND (o.fecha_cv < p.fecha_cv OR (o.fecha_cv = p.fecha_cv AND o.codigo_cv < p.codigo_cv))
-         AND p.fecha_cv <= o.fecha_nc + 31
-         -- Solo si la NC es de un MES ANTERIOR al de la re-venta: NC y re-venta en el mismo
-         -- mes = la re-venta cuenta como operación de ese mes (como en el detalle de ventas).
-         AND date_trunc('month', o.fecha_nc) < date_trunc('month', p.fecha_cv)
-      )
-      SELECT v.codigo_cv, (rf.codigo_cv IS NOT NULL) AS es_refacturacion, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+    // es_anulada: estado NC/incautación/error/moras/anulado → no cuenta como operación
+    // (ni en el detalle de ventas); sus montos siguen restando por mes de afectación.
+    const rows = await cached(`realzza/modulo|v4|${anio}`, req.query.fresh, async () => (await pgPool.query(`
+      WITH ${MAPA_SQL_CALL_ACTIVO}
+      SELECT v.codigo_cv, ${ANULADA_SQL('v.estado_venta')} AS es_anulada, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
              v.doc_identidad, v.productos, v.cuotas, v.estado_venta, v.entidad, v.vendedor,
              COALESCE(r.asesor_venta, v.asesor_venta) AS asesor_venta,
              v.tipo_credito, COALESCE(r.tipo_producto, v.estado_tipo_producto) AS tipo_producto,
@@ -1698,7 +1677,6 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
         ORDER BY gr.marca_temporal DESC LIMIT 1
       ) grz ON true
       LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
-      LEFT JOIN refact rf ON rf.codigo_cv = v.codigo_cv
       WHERE v.sede ILIKE '%REALZZA%' AND (v.anio_cv = $2 OR v.anio_af = $2)`, [DERIV_MOTIVOS, anio, DERIV_MOTIVOS_RZ])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
@@ -1739,7 +1717,7 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
     const mesHasta = parseInt(req.query.mesHasta, 10) || (hoy.getMonth() + 1);
 
     const tienda = tiendaRzParam(req.query.tienda);
-    const rows = await cached(`ventas-realzza-motos-fuente|v3|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}|${tienda}`, req.query.fresh, async () => (await pgPool.query(`
+    const rows = await cached(`ventas-realzza-motos-fuente|v4|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}|${tienda}`, req.query.fresh, async () => (await pgPool.query(`
       WITH ${MAPA_SQL_CALL_ACTIVO},
       base AS (
         SELECT v.codigo_cv, v.estado_venta, v.anio_cv, v.mes_cv, v.anio_af, v.mes_af, v.fecha_cv,
@@ -1775,30 +1753,11 @@ app.get('/ventas-realzza/motos-fuente', async (req, res) => {
                WHEN UPPER(COALESCE(tipo_base,'')) = 'MARKET PLACE' THEN 'MARKETPLACE'
                ELSE NULL END AS grupo
         FROM base
-      ),
-      -- # motos = FACTURADAS del mes (una moto con NC sigue contando en su mes de venta)
-      -- MENOS las refacturaciones (re-venta al mismo cliente tras la NC) — mismo criterio
-      -- que el Reporte Global y que las tablas de Ventas Campo. Antes: vigentes − NC
-      -- arrastradas → una moto anulada en un mes posterior se descontaba DOS veces.
-      nc_orig AS (
-        SELECT codigo_cv, fecha_cv, COALESCE(fecha_af, fecha_cv) AS fecha_nc,
-               regexp_replace(COALESCE(doc_identidad,''), '\\D', '', 'g') AS dni
-        FROM ventas
-        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%'
-          AND fecha_cv >= make_date($2::int, $3::int, 1) - 183
-      ),
-      refact AS (
-        SELECT DISTINCT p.codigo_cv FROM cat p
-        JOIN nc_orig o ON o.dni = p.dni AND p.dni <> '' AND o.codigo_cv <> p.codigo_cv
-         AND (o.fecha_cv < p.fecha_cv OR (o.fecha_cv = p.fecha_cv AND o.codigo_cv < p.codigo_cv))
-         AND p.fecha_cv <= o.fecha_nc + 31
-         -- Solo si la NC es de un MES ANTERIOR al de la re-venta: NC y re-venta en el mismo
-         -- mes = la re-venta cuenta como operación de ese mes (como en el detalle de ventas).
-         AND date_trunc('month', o.fecha_nc) < date_trunc('month', p.fecha_cv)
       )
+      -- # motos = ventas del mes que siguen vigentes (sin NC/incautación/error/moras/anulado).
       SELECT anio_cv AS anio, mes_cv AS mes, grupo, COUNT(*)::int AS ops
       FROM cat
-      WHERE grupo IS NOT NULL AND codigo_cv NOT IN (SELECT codigo_cv FROM refact)
+      WHERE grupo IS NOT NULL AND NOT ${ANULADA_SQL('estado_venta')}
         AND (anio_cv, mes_cv) >= ($2::int, $3::int) AND (anio_cv, mes_cv) <= ($4::int, $5::int)
       GROUP BY 1, 2, 3
       ORDER BY 1, 2, 3`,
@@ -2889,7 +2848,7 @@ app.get('/avance-sedes', async (req, res) => {
     await ensureVentasSchema();
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
     const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;   // 0 = todo el año
-    const key = `avance-sedes|v3|${anio}|${mes}`;
+    const key = `avance-sedes|v4|${anio}|${mes}`;
     const rows = await cached(key, req.query.fresh, async () => (await pgPool.query(`
       WITH ent AS (
         SELECT sede,
@@ -2901,7 +2860,7 @@ app.get('/avance-sedes', async (req, res) => {
       ),
       -- Mismo criterio que el Reporte Global: la venta cuenta SIEMPRE en su mes (aunque
       -- luego tenga NC) y cada NC/incautación resta en SU mes de afectación (mismo mes →
-      -- netea a 0). # operaciones = facturadas − refacturaciones. Antes se excluía del mes
+      -- netea a 0). # operaciones = ventas del periodo SIN las anuladas (NC/incaut./...). Antes se excluía del mes
       -- de venta toda venta hoy anulada Y además se restaba en su mes de afectación →
       -- doble descuento en los meses pasados.
       per AS (
@@ -2909,7 +2868,7 @@ app.get('/avance-sedes', async (req, res) => {
       ),${REFACT_CTE},
       ven AS (
         SELECT sede, clase, es_moto, SUM(monto_consolidado) AS monto,
-               COUNT(*) FILTER (WHERE r.codigo_cv IS NULL) AS ops
+               COUNT(*) FILTER (WHERE r.codigo_cv IS NULL) AS ops   -- sin las anuladas (ver REFACT_CTE)
         FROM per LEFT JOIN refact r USING (codigo_cv)
         GROUP BY sede, clase, es_moto
       ),
@@ -2990,28 +2949,22 @@ app.get('/avance-vendedor', async (req, res) => {
 //   crédito/incautaciones de ningún mes. neto/ops quedan iguales a monto_bruto/ops_bruto
 //   (se mantienen ambos nombres por compatibilidad con el resto del código).
 // ═════════════════════════════════════════════════════════════════════════════
-// Refacturaciones del periodo: venta (en `per`) a un cliente cuyo DNI tiene una venta
-// anterior anulada por NOTA DE CRÉDITO, del mismo tipo (moto / no moto), facturada hasta
-// 31 días después de esa NC. Esa re-venta NO cuenta como operación nueva: la operación es
-// la venta original, que sigue contando en su mes aunque luego tenga NC. Solo afecta los
-// CONTEOS; los montos netos ya cuadran (la NC resta y la refacturación suma: netea a 0).
-// `per` = CTE con codigo_cv, fecha_cv, dni, es_moto de las ventas del periodo.
+// Ventas que NO cuentan como operación: su estado es NOTA DE CRÉDITO, INCAUTACIÓN, ERROR
+// DEL SISTEMA, MORAS MAL COBRADAS o ANULADO. No entran al N° de operaciones/motos ni al
+// detalle de ventas (se ven en el detalle de notas de crédito). La re-venta al mismo
+// cliente (refacturación) SÍ cuenta: la original anulada ya no se cuenta. Solo afecta los
+// CONTEOS; los montos siguen igual (venta en su mes − NC en su mes de afectación).
+function ANULADA_SQL(col = 'estado_venta') {
+  const e = `UPPER(COALESCE(${col},''))`;
+  return `(${e} LIKE '%NOTA DE%' OR ${e} LIKE '%INCAUTAC%' OR ${e} LIKE '%ERROR DEL SISTEMA%'
+           OR ${e} LIKE '%MORAS MAL COBRADAS%' OR ${e} LIKE '%ANULAD%')`;
+}
+// `per` = CTE con codigo_cv de las ventas del periodo. Se llama `refact` por compatibilidad:
+// `LEFT JOIN refact r ... COUNT(*) FILTER (WHERE r.codigo_cv IS NULL)` = ventas que cuentan.
 const REFACT_CTE = `
-      nc_orig AS (
-        SELECT codigo_cv, fecha_cv, COALESCE(fecha_af, fecha_cv) AS fecha_nc,
-               regexp_replace(COALESCE(doc_identidad,''), '\\D', '', 'g') AS dni,
-               (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto
-        FROM ventas
-        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%NOTA DE%' AND fecha_cv >= make_date($1, 1, 1) - 183
-      ),
       refact AS (
-        SELECT DISTINCT p.codigo_cv FROM per p
-        JOIN nc_orig o ON o.dni = p.dni AND p.dni <> '' AND o.es_moto = p.es_moto AND o.codigo_cv <> p.codigo_cv
-         AND (o.fecha_cv < p.fecha_cv OR (o.fecha_cv = p.fecha_cv AND o.codigo_cv < p.codigo_cv))
-         AND p.fecha_cv <= o.fecha_nc + 31
-         -- Solo si la NC es de un MES ANTERIOR al de la re-venta: NC y re-venta en el mismo
-         -- mes = la re-venta cuenta como operación de ese mes (como en el detalle de ventas).
-         AND date_trunc('month', o.fecha_nc) < date_trunc('month', p.fecha_cv)
+        SELECT DISTINCT v.codigo_cv FROM ventas v
+        WHERE v.codigo_cv IN (SELECT codigo_cv FROM per) AND ${ANULADA_SQL('v.estado_venta')}
       )`;
 
 app.get('/reporte-global', async (req, res) => {
@@ -3022,7 +2975,7 @@ app.get('/reporte-global', async (req, res) => {
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
     const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;   // 0 = todo el año
     const dia = req.query.dia ? parseInt(req.query.dia, 10) : 0;   // 0 = sin tope de día (mes/año completo)
-    const rows = await cached(`reporte-global|v3|${anio}|${mes}|${dia}`, req.query.fresh, async () => (await pgPool.query(`
+    const rows = await cached(`reporte-global|v4|${anio}|${mes}|${dia}`, req.query.fresh, async () => (await pgPool.query(`
       WITH ent AS (
         SELECT sede,
           NULLIF(UPPER(TRIM(COALESCE(entidad,''))),'') AS entidad,
@@ -3042,7 +2995,7 @@ app.get('/reporte-global', async (req, res) => {
       bruto AS (
         -- TODAS las ventas del periodo por su mes de VENTA (congelado), incluidas las que
         -- ya son NC/incautación a valor pleno — es el universo "monto_bruto"/"ops_bruto".
-        -- ops_conteo = las mismas operaciones SIN las refacturaciones (ver REFACT_CTE).
+        -- ops_conteo = las mismas operaciones SIN las anuladas (NC/incautación/... ver REFACT_CTE).
         SELECT sede, entidad, es_moto, con_cuotas, SUM(monto_consolidado) AS monto, COUNT(*) AS ops,
                COUNT(*) FILTER (WHERE r.codigo_cv IS NULL) AS ops_conteo
         FROM per LEFT JOIN refact r USING (codigo_cv)
@@ -3097,7 +3050,8 @@ app.get('/reporte-global-detalle', async (req, res) => {
     const sedes = String(req.query.sede || '').split(',').map(s => s.trim()).filter(Boolean);
     if (!sedes.length) return res.json([]);
 
-    const cond = ['monto_consolidado > 0', 'anio_cv = $1', '($2 = 0 OR mes_cv = $2)', '($3 = 0 OR dia_cv <= $3)', 'sede = ANY($4::text[])'];
+    // Detalle de VENTAS: sin las anuladas (NC/incautación/...): se ven en el detalle de NC.
+    const cond = ['monto_consolidado > 0', 'anio_cv = $1', '($2 = 0 OR mes_cv = $2)', '($3 = 0 OR dia_cv <= $3)', 'sede = ANY($4::text[])', `NOT ${ANULADA_SQL('estado_venta')}`];
     const params = [anio, mes, dia, sedes];
 
     if (req.query.entidad !== undefined) {
@@ -3139,12 +3093,7 @@ app.get('/reporte-global-detalle', async (req, res) => {
     const { rows } = await pgPool.query(`
       WITH base AS (
         SELECT * FROM ventas WHERE ${cond.join(' AND ')}
-      ),
-      per AS (
-        SELECT codigo_cv, fecha_cv, regexp_replace(COALESCE(doc_identidad,''), '\\D', '', 'g') AS dni,
-               (UPPER(COALESCE(estado_tipo_producto,'')) LIKE '%MOTO%') AS es_moto
-        FROM base
-      ),${REFACT_CTE}
+      )
       SELECT b.codigo_cv, b.vendedor, b.cliente_venta AS cliente, b.doc_identidad AS dni, b.productos AS producto,
         COALESCE(NULLIF(TRIM(b.entidad),''), 'LEONCITO') AS entidad, b.estado_venta,
         CASE WHEN UPPER(COALESCE(b.productos,'')) LIKE '%WANXIN%' THEN 'WANXIN'
@@ -3161,8 +3110,8 @@ app.get('/reporte-global-detalle', async (req, res) => {
         (UPPER(COALESCE(b.estado_venta,'')) LIKE '%NOTA DE%' OR UPPER(COALESCE(b.estado_venta,'')) LIKE '%INCAUTAC%') AS tiene_nc,
         b.dia_af, b.mes_af, b.anio_af,
         (b.anio_af IS NOT NULL AND (b.anio_af * 12 + b.mes_af) > (b.anio_cv * 12 + b.mes_cv)) AS nc_mes_posterior,
-        (r.codigo_cv IS NOT NULL) AS es_refacturacion
-      FROM base b LEFT JOIN refact r ON r.codigo_cv = b.codigo_cv
+        false AS es_refacturacion
+      FROM base b
       ORDER BY b.anio_cv DESC, b.mes_cv DESC, b.dia_cv DESC, b.monto_consolidado DESC`,
       params);
     res.json(rows);
@@ -3186,7 +3135,7 @@ app.get('/reporte-global-motos', async (req, res) => {
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
     const mes = req.query.mes ? parseInt(req.query.mes, 10) : 0;
     const dia = req.query.dia ? parseInt(req.query.dia, 10) : 0;   // 0 = sin tope de día
-    const rows = await cached(`reporte-global-motos|v3|${anio}|${mes}|${dia}`, req.query.fresh, async () => (await pgPool.query(`
+    const rows = await cached(`reporte-global-motos|v4|${anio}|${mes}|${dia}`, req.query.fresh, async () => (await pgPool.query(`
       WITH ent AS (
         SELECT
           CASE WHEN UPPER(COALESCE(entidad,'')) = 'GLOBAL GO' THEN 'GLOBAL' ELSE 'PROPIO' END AS credito,
@@ -3368,7 +3317,8 @@ app.get('/ventas-linea-asesor', async (req, res) => {
       cat AS (SELECT *, ${CAT_CASE} AS categoria FROM base),
       ven AS (
         SELECT asesor_key, anio_cv AS anio, mes_cv AS mes, categoria,
-          SUM(monto_consolidado) AS monto, COUNT(*)::int AS ops
+          SUM(monto_consolidado) AS monto,
+          COUNT(*) FILTER (WHERE NOT ${ANULADA_SQL('estado_venta')})::int AS ops
         FROM cat
         -- La venta cuenta en su mes (congelada, aunque luego tenga NC); la NC/incautación
         -- resta en SU mes de afectación (mismo mes → netea a 0) — igual que Ventas Campo.
@@ -3389,7 +3339,7 @@ app.get('/ventas-linea-asesor', async (req, res) => {
       claves AS (SELECT asesor_key, anio, mes, categoria FROM ven UNION SELECT asesor_key, anio, mes, categoria FROM canc)
       SELECT k.asesor_key AS asesor, k.anio, k.mes, k.categoria,
         ROUND(COALESCE(v.monto,0) - COALESCE(c.monto,0))::int AS monto,
-        GREATEST(COALESCE(v.ops,0) - COALESCE(c.ops,0), 0)::int AS ops
+        COALESCE(v.ops,0)::int AS ops   -- ventas vigentes: las anuladas no cuentan ni restan
       FROM claves k
       LEFT JOIN ven  v ON v.asesor_key=k.asesor_key AND v.anio=k.anio AND v.mes=k.mes AND v.categoria=k.categoria
       LEFT JOIN canc c ON c.asesor_key=k.asesor_key AND c.anio=k.anio AND c.mes=k.mes AND c.categoria=k.categoria
@@ -3425,7 +3375,7 @@ app.get('/ventas-linea-asesor', async (req, res) => {
       GROUP BY 1, 2, 3, 4
       ORDER BY 1, 2, 3`;
 
-    const rows = await cached(`ventas-linea-asesor|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}|${tienda}`, req.query.fresh,
+    const rows = await cached(`ventas-linea-asesor|v2|${canal}|${anioDesde}|${mesDesde}|${anioHasta}|${mesHasta}|${tienda}`, req.query.fresh,
       async () => (await pgPool.query(sql, [anioDesde, mesDesde, anioHasta, mesHasta])).rows);
 
     // Meses "proyección": el mes aún no está cubierto del todo por margen_ventas
