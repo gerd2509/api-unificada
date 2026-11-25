@@ -1506,6 +1506,73 @@ app.post('/recordatorios/:id/visto', async (req, res) => {
   } catch (e) { console.error('❌ POST /recordatorios/:id/visto:', e.message); res.status(500).json({ success: false, message: 'Error interno del servidor.' }); }
 });
 
+// ── Recordatorios EN VIVO (Server-Sent Events) ──────────────────────────────
+// El panel del asesor deja abierta una conexión y aquí se le empuja el recordatorio
+// apenas Pulso lo crea (≈ 3 s), en vez de esperar a la próxima consulta. Un solo
+// SELECT cada 3 s para TODOS los conectados, y solo mientras haya alguien conectado.
+// Mantener la conexión cuesta un "ping" de pocos bytes cada 25 s.
+const suscriptoresRec = new Map();   // asesor → Set(res)
+let ultimoIdRec = null;
+let timerRec = null;
+
+async function revisarRecordatoriosNuevos() {
+  if (!suscriptoresRec.size) { clearInterval(timerRec); timerRec = null; ultimoIdRec = null; return; }
+  try {
+    if (ultimoIdRec === null) {
+      const { rows } = await pgPool.query('SELECT COALESCE(MAX(id), 0) AS m FROM pulso_recordatorios');
+      ultimoIdRec = Number(rows[0].m);
+      return;
+    }
+    const { rows } = await pgPool.query(
+      `SELECT id, asesor, titulo, mensaje, detalle, origen, creado_en
+         FROM pulso_recordatorios WHERE id > $1 ORDER BY id LIMIT 200`, [ultimoIdRec]);
+    for (const r of rows) {
+      ultimoIdRec = Math.max(ultimoIdRec, Number(r.id));
+      const conexiones = suscriptoresRec.get(r.asesor);
+      if (!conexiones) continue;
+      const { asesor, ...dato } = r;
+      const evento = `event: recordatorio\ndata: ${JSON.stringify(dato)}\n\n`;
+      for (const res of conexiones) res.write(evento);
+    }
+  } catch (e) {
+    if (e.code !== '42P01') console.error('⚠️ recordatorios en vivo:', e.message);
+  }
+}
+
+// GET /recordatorios/stream → conexión abierta (text/event-stream) del asesor logueado
+app.get('/recordatorios/stream', (req, res) => {
+  const vendedor = vendedorDeSesion(req);
+  if (!pgPool || !vendedor) return res.status(400).json({ success: false, message: 'Solo para asesores.' });
+
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',   // no-transform: compression() no lo comprime (no lo retiene)
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  res.write('retry: 5000\n\n');
+
+  if (!suscriptoresRec.has(vendedor)) suscriptoresRec.set(vendedor, new Set());
+  const conexiones = suscriptoresRec.get(vendedor);
+  // Máximo 3 pestañas por asesor: la más antigua se cierra
+  if (conexiones.size >= 3) { const vieja = conexiones.values().next().value; conexiones.delete(vieja); vieja.end(); }
+  conexiones.add(res);
+  if (!timerRec) { ultimoIdRec = null; revisarRecordatoriosNuevos(); timerRec = setInterval(revisarRecordatoriosNuevos, 3000); }
+
+  const ping = setInterval(() => res.write(': ping\n\n'), 25000);
+  // Cuando vence la sesión (JWT de 12 h) se corta; el panel ya no tiene token válido
+  const msHastaVencer = req.usuario?.exp ? req.usuario.exp * 1000 - Date.now() : 0;
+  const fin = msHastaVencer > 0 ? setTimeout(() => res.end(), Math.min(msHastaVencer, 2147483000)) : null;
+
+  req.on('close', () => {
+    clearInterval(ping);
+    if (fin) clearTimeout(fin);
+    conexiones.delete(res);
+    if (!conexiones.size) suscriptoresRec.delete(vendedor);
+  });
+});
+
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
   ok: true, service: 'gestion-service', db: !!pgPool, ts: new Date().toISOString(),
