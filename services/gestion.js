@@ -780,6 +780,7 @@ const GK_COLS = [
   'marca_temporal', 'marca_temporal_raw', 'registrado_por', 'canal',
   'tienda', 'fecha_lead_asignado', 'nombre_cliente', 'asesor', 'sede',
   'dni_cliente', 'celular_gestionado', 'tipo_cliente', 'estado_gestion', 'resultado_gestion', 'market_place',
+  'mk_presupuesto',   // MK - Presupuesto (SI | NO)
   // Leoncito
   'producto_interes', 'motivo_interes', 'motivo_agendamiento',
   'fecha_interes_agend', 'hora_interes_agend', 'comentario_agend',
@@ -813,6 +814,7 @@ async function ensureGestionKommoSchema() {
       origen TEXT NOT NULL DEFAULT 'dashboard'
     );
     ALTER TABLE gestion_kommo ADD COLUMN IF NOT EXISTS origen TEXT NOT NULL DEFAULT 'dashboard';
+    ALTER TABLE gestion_kommo ADD COLUMN IF NOT EXISTS mk_presupuesto TEXT;
     CREATE INDEX IF NOT EXISTS ix_gk_marca  ON gestion_kommo (marca_temporal);
     CREATE INDEX IF NOT EXISTS ix_gk_origen ON gestion_kommo (origen);
     CREATE INDEX IF NOT EXISTS ix_gk_canal  ON gestion_kommo (canal);
@@ -861,6 +863,7 @@ function gkRowToSheet(r) {
     'ESTADO DE GESTIÓN REALZZA': esR ? (r.estado_gestion || '') : '',
     'MARKET PLACE L': esR ? '' : (r.market_place || ''),
     'MARKET PLACE R': esR ? (r.market_place || '') : '',
+    'MK - PRESUPUESTO': r.mk_presupuesto || '',
     'MOTIVO DE NO CIERRE': r.motivo_no_cierre || '',
     'COMENTARIO VENTA NO CONCRETADA': r.comentario_venta_no_concretada || '',
     id: r.id,
